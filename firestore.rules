@@ -48,13 +48,19 @@ service cloud.firestore {
     //   - totalVolume: number (required)
     //   - intervals: map (required)
     //
+    // Collection: historicalVolume
+    // Fields:
+    //   - date: string (required, YYYY-MM-DD)
+    //   - day: string (required)
+    //   - totalVolume: number (required)
+    //   - intervals: map (required)
+    //
     // Collection: workingDaysRef
     // Fields:
     //   - month: string (required, MMM-yy)
     //   - totalDays: number (required)
     //   - workingDays: number (required)
-    //   - weekend: number (required)
-    //   - holiday: number (required)
+    //   - offday: number (required)
     //
     // Collection: erlangResults
     // Fields:
@@ -75,9 +81,9 @@ service cloud.firestore {
 
     function isAdmin() {
       return isAuthenticated() && 
-        ((request.auth.token.email == "taqienahmad@gmail.com" && request.auth.token.email_verified == true) ||
-         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'));
+             ((request.auth.token.email == "taqienahmad@gmail.com" && request.auth.token.email_verified == true) ||
+              (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+               get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'));
     }
 
     function isOwner(userId) {
@@ -128,13 +134,20 @@ service cloud.firestore {
              data.intervals is map;
     }
 
+    function isValidHistoricalVolume(data) {
+      return data.keys().hasAll(['date', 'day', 'totalVolume', 'intervals']) &&
+             data.date is string && data.date.matches("^\\d{4}-\\d{2}-\\d{2}$") &&
+             data.day is string &&
+             data.totalVolume is number &&
+             data.intervals is map;
+    }
+
     function isValidWorkingDaysRef(data) {
-      return data.keys().hasAll(['month', 'totalDays', 'workingDays', 'weekend', 'holiday']) &&
+      return data.keys().hasAll(['month', 'totalDays', 'workingDays', 'offday']) &&
              data.month is string &&
              data.totalDays is number &&
              data.workingDays is number &&
-             data.weekend is number &&
-             data.holiday is number;
+             data.offday is number;
     }
 
     function isValidErlangResult(data) {
@@ -149,13 +162,25 @@ service cloud.firestore {
              data.assignments is map;
     }
 
+    function isValidLeaveRequest(data) {
+      return data.keys().hasAll(['employeeId', 'date', 'status']) &&
+             data.employeeId is string &&
+             data.date is string && data.date.matches("^\\d{4}-\\d{2}-\\d{2}$") &&
+             data.status in ['pending', 'approved', 'rejected'] &&
+             (!('type' in data) || data.type in ['annual', 'sick', 'casual', 'other']) &&
+             (!('submittedAt' in data) || data.submittedAt is string) &&
+             (!('employeeName' in data) || data.employeeName is string) &&
+             (!('reason' in data) || (data.reason is string || data.reason == null));
+    }
+
     // ===============================================================
     // Rules
     // ===============================================================
 
     match /users/{userId} {
       allow read: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
-      allow write: if isAdmin();
+      allow create: if isAuthenticated() && request.auth.uid == userId;
+      allow update: if isAdmin();
     }
 
     match /employees/{employeeId} {
@@ -188,6 +213,12 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    match /historicalVolume/{date} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAdmin() && isValidHistoricalVolume(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
     match /workingDaysRef/{month} {
       allow read: if isAuthenticated();
       allow create, update: if isAdmin() && isValidWorkingDaysRef(request.resource.data);
@@ -208,6 +239,40 @@ service cloud.firestore {
     match /roster/{id} {
       allow read: if isAuthenticated();
       allow write: if isAdmin();
+    }
+
+    match /leaveRequests/{requestId} {
+      // Allow read if user is admin, owner, or if the leave is approved (needed for roster visibility)
+      allow read: if isAuthenticated() && (
+        isAdmin() || 
+        (resource != null && resource.data.employeeId == request.auth.uid) ||
+        (resource != null && resource.data.status == 'approved')
+      );
+      
+      allow create: if isAuthenticated() && (
+                      isAdmin() || 
+                      (request.resource.data.employeeId == request.auth.uid && 
+                       request.resource.data.status == 'pending' &&
+                       isValidLeaveRequest(request.resource.data))
+                    );
+                    
+      allow update: if isAuthenticated() && (
+        isAdmin() || 
+        (resource != null && request.auth.uid == resource.data.employeeId && 
+         request.resource.data.status == resource.data.status && 
+         isValidLeaveRequest(request.resource.data))
+      );
+      
+      allow delete: if isAdmin() || (
+        isAuthenticated() && 
+        resource != null && 
+        request.auth.uid == resource.data.employeeId && 
+        resource.data.status == 'pending'
+      );
+    }
+
+    match /test/connection {
+      allow read: if true;
     }
   }
 }

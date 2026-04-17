@@ -4,6 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from '@/components/ui/dialog';
 import { Plus, Trash2, Edit2, Clock, Upload, Download } from 'lucide-react';
 import { toast } from 'sonner';
@@ -14,6 +15,7 @@ export interface ShiftCode {
   name: string;
   startTime: string;
   endTime: string;
+  isNightShift: boolean;
 }
 
 export default function ShiftCodeManager({ isAdmin }: { isAdmin: boolean }) {
@@ -24,7 +26,8 @@ export default function ShiftCodeManager({ isAdmin }: { isAdmin: boolean }) {
     code: '',
     name: '',
     startTime: '08:00',
-    endTime: '16:00'
+    endTime: '16:00',
+    isNightShift: false
   });
 
   useEffect(() => {
@@ -39,7 +42,7 @@ export default function ShiftCodeManager({ isAdmin }: { isAdmin: boolean }) {
   }, []);
 
   const downloadTemplate = () => {
-    const csvContent = "sep=;\nCode;Interval\nDay Off;00:00-00:00\nP37;03:00-12:00\nNS;08:00-17:00\nS8;17:00-02:00\nLeave;Annual Leave";
+    const csvContent = "sep=;\nCode;Interval;IsNight\nDay Off;00:00-00:00;No\nP37;03:00-12:00;No\nNS;08:00-17:00;No\nS8;17:00-02:00;Yes\nLeave;Annual Leave;No";
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -100,9 +103,11 @@ export default function ShiftCodeManager({ isAdmin }: { isAdmin: boolean }) {
           const values = lines[i].split(separator).map(v => v.trim());
           const codeIndex = headers.findIndex(h => h.includes('code'));
           const intervalIndex = headers.findIndex(h => h.includes('interval'));
+          const nightIndex = headers.findIndex(h => h.includes('night') || h.includes('type'));
           
           const code = values[codeIndex];
           const interval = values[intervalIndex];
+          const isNight = nightIndex !== -1 ? (values[nightIndex].toLowerCase() === 'yes' || values[nightIndex].toLowerCase() === 'true' || values[nightIndex].toLowerCase() === 'night') : false;
 
           if (code && interval) {
             try {
@@ -124,7 +129,8 @@ export default function ShiftCodeManager({ isAdmin }: { isAdmin: boolean }) {
                 code: code.toUpperCase(),
                 name,
                 startTime,
-                endTime
+                endTime,
+                isNightShift: isNight
               });
               successCount++;
             } catch (err) {
@@ -167,7 +173,7 @@ export default function ShiftCodeManager({ isAdmin }: { isAdmin: boolean }) {
   };
 
   const resetForm = () => {
-    setFormData({ code: '', name: '', startTime: '08:00', endTime: '16:00' });
+    setFormData({ code: '', name: '', startTime: '08:00', endTime: '16:00', isNightShift: false });
     setEditingCode(null);
   };
 
@@ -177,7 +183,8 @@ export default function ShiftCodeManager({ isAdmin }: { isAdmin: boolean }) {
       code: code.code,
       name: code.name,
       startTime: code.startTime,
-      endTime: code.endTime
+      endTime: code.endTime,
+      isNightShift: !!code.isNightShift
     });
     setIsDialogOpen(true);
   };
@@ -301,6 +308,18 @@ export default function ShiftCodeManager({ isAdmin }: { isAdmin: boolean }) {
                       />
                     </div>
                   </div>
+                  <div className="flex items-center space-x-2 pt-2">
+                    <input 
+                      type="checkbox" 
+                      id="isNightShift"
+                      checked={formData.isNightShift}
+                      onChange={(e) => setFormData({ ...formData, isNightShift: e.target.checked })}
+                      className="w-4 h-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                    />
+                    <label htmlFor="isNightShift" className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">
+                      Mark as Night Shift (Female agents will not be assigned)
+                    </label>
+                  </div>
                   <DialogFooter>
                     <Button type="submit" className="w-full">
                       {editingCode ? 'Update Shift Code' : 'Create Shift Code'}
@@ -345,6 +364,7 @@ export default function ShiftCodeManager({ isAdmin }: { isAdmin: boolean }) {
               <TableHead>Code</TableHead>
               <TableHead>Name</TableHead>
               <TableHead>Hours</TableHead>
+              <TableHead>Type</TableHead>
               {isAdmin && <TableHead className="text-right">Actions</TableHead>}
             </TableRow>
           </TableHeader>
@@ -359,6 +379,17 @@ export default function ShiftCodeManager({ isAdmin }: { isAdmin: boolean }) {
                       <Clock className="w-4 h-4" />
                       {code.startTime} - {code.endTime}
                     </div>
+                  </TableCell>
+                  <TableCell>
+                    {code.isNightShift ? (
+                      <Badge variant="outline" className="bg-slate-900 text-white border-none gap-1">
+                        <Clock className="w-3 h-3" /> Night
+                      </Badge>
+                    ) : (
+                      <Badge variant="secondary" className="bg-amber-50 text-amber-700 border-amber-200 gap-1">
+                        <Clock className="w-3 h-3" /> Day
+                      </Badge>
+                    )}
                   </TableCell>
                   {isAdmin && (
                     <TableCell className="text-right">

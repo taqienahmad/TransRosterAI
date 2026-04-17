@@ -6,8 +6,12 @@ import { Input } from '@/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
-import { Users, UserPlus, Search, Trash2, Edit2, Upload, Download, FileSpreadsheet } from 'lucide-react';
+import { Users, UserPlus, Search, Trash2, Edit2, Upload, Download, FileSpreadsheet, CheckSquare, Square, Settings2, Zap } from 'lucide-react';
 import { toast } from 'sonner';
+import { Checkbox } from '@/components/ui/checkbox';
+import { writeBatch } from '../lib/firebase';
+import { ShiftCode } from './ShiftCodeManager';
+import { Label } from '@/components/ui/label';
 
 interface Employee {
   id: string;
@@ -22,12 +26,17 @@ interface Employee {
   role: string;
   department: string;
   skills: string[];
+  preferredShifts?: string[];
+  extraWorkingDays?: number;
+  extraHours?: number;
 }
 
 export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
   const [employees, setEmployees] = useState<Employee[]>([]);
+  const [shiftCodes, setShiftCodes] = useState<ShiftCode[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false);
+  const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
   const [newEmployee, setNewEmployee] = useState<Partial<Employee>>({
     nip: '',
     name: '',
@@ -39,8 +48,16 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
     religion: '',
     role: '',
     department: '',
-    skills: []
+    skills: [],
+    preferredShifts: [],
+    extraWorkingDays: 0,
+    extraHours: 0
   });
+  const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [isBulkUpdateOpen, setIsBulkUpdateOpen] = useState(false);
+  const [bulkData, setBulkData] = useState({ extraWorkingDays: 0, extraHours: 0 });
+  const [isUpdating, setIsUpdating] = useState(false);
 
   useEffect(() => {
     const q = query(collection(db, 'employees'), orderBy('name'));
@@ -50,11 +67,20 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
     }, (error) => {
       handleFirestoreError(error, OperationType.LIST, 'employees');
     });
-    return () => unsubscribe();
+
+    const qShifts = query(collection(db, 'shiftCodes'));
+    const unsubShifts = onSnapshot(qShifts, (snapshot) => {
+      setShiftCodes(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as ShiftCode)));
+    });
+
+    return () => {
+      unsubscribe();
+      unsubShifts();
+    };
   }, []);
 
   const downloadTemplate = () => {
-    const csvContent = "sep=;\nNo;NIP;Name;Skill;Channel;Site;Gender;Religion\n1;6011450;Abu Sofyan;MPBK;Call;Semarang;L;Islam\n2;6012118;Achmad Luthfi Zakiya;PBK;Call;Semarang;L;Islam";
+    const csvContent = "sep=;\nNo;NIP;Name;Skill;Channel;Site;Gender;Religion;PreferredShifts\n1;6011450;Abu Sofyan;MPBK;Call;Semarang;L;Islam;P37,NS\n2;6012118;Achmad Luthfi Zakiya;PBK;Call;Semarang;L;Islam;";
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -124,7 +150,8 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
               'channel': 'channel',
               'site': 'site',
               'gender': 'gender',
-              'religion': 'religion'
+              'religion': 'religion',
+              'preferred': 'preferredShifts'
             };
             // Find mapping that is contained in the header
             const matchedKey = Object.keys(mapping).find(key => header.includes(key));
@@ -135,6 +162,9 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
 
           if (empData.name && empData.nip && empData.skill) {
             try {
+              if (empData.preferredShifts && typeof empData.preferredShifts === 'string') {
+                empData.preferredShifts = empData.preferredShifts.split(',').map((s: string) => s.trim().toUpperCase()).filter((s: string) => s.length > 0);
+              }
               const id = empData.nip || Math.random().toString(36).substring(2, 9);
               await setDoc(doc(db, 'employees', id), { 
                 ...empData, 
@@ -183,18 +213,89 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
         email: newEmployee.email || '',
         role: newEmployee.role || newEmployee.skill || '',
         department: newEmployee.department || newEmployee.site || '',
-        skills: []
+        skills: [],
+        extraWorkingDays: Number(newEmployee.extraWorkingDays) || 0,
+        extraHours: Number(newEmployee.extraHours) || 0
       });
       toast.success('Employee added successfully');
       setIsAddDialogOpen(false);
       setNewEmployee({ 
         nip: '', name: '', email: '', skill: '', channel: '', 
         site: '', gender: 'L', religion: '', role: '', 
-        department: '', skills: [] 
+        department: '', skills: [], extraWorkingDays: 0, extraHours: 0
       });
     } catch (error) {
       handleFirestoreError(error, OperationType.CREATE, 'employees');
     }
+  };
+
+  const handleUpdateEmployee = async () => {
+    if (!editingEmployee || !editingEmployee.name || !editingEmployee.nip || !editingEmployee.skill) {
+      toast.error('Please fill in required fields');
+      return;
+    }
+
+    try {
+      await setDoc(doc(db, 'employees', editingEmployee.id), {
+        ...editingEmployee,
+        extraWorkingDays: Number(editingEmployee.extraWorkingDays) || 0,
+        extraHours: Number(editingEmployee.extraHours) || 0
+      });
+      toast.success('Employee updated successfully');
+      setIsEditDialogOpen(false);
+      setEditingEmployee(null);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, 'employees');
+    }
+  };
+
+  const handleBulkUpdate = async (applyToAll: boolean = false) => {
+    setIsUpdating(true);
+    try {
+      const batch = writeBatch(db);
+      const targets = applyToAll ? employees : employees.filter(e => selectedIds.has(e.id));
+      
+      if (targets.length === 0) {
+        toast.error('No employees selected');
+        return;
+      }
+
+      targets.forEach(emp => {
+        const ref = doc(db, 'employees', emp.id);
+        batch.update(ref, {
+          extraWorkingDays: Number(bulkData.extraWorkingDays) || 0,
+          extraHours: Number(bulkData.extraHours) || 0
+        });
+      });
+
+      await batch.commit();
+      toast.success(`Successfully updated ${targets.length} employees`);
+      setIsBulkUpdateOpen(false);
+      setSelectedIds(new Set());
+    } catch (error) {
+      console.error(error);
+      toast.error('Failed to update employees');
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+
+  const toggleSelectAll = () => {
+    if (selectedIds.size === filteredEmployees.length) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(filteredEmployees.map(e => e.id)));
+    }
+  };
+
+  const toggleSelect = (id: string) => {
+    const newSelected = new Set(selectedIds);
+    if (newSelected.has(id)) {
+      newSelected.delete(id);
+    } else {
+      newSelected.add(id);
+    }
+    setSelectedIds(newSelected);
   };
 
   const handleDeleteEmployee = async (id: string) => {
@@ -236,6 +337,65 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
         
         {isAdmin && (
           <div className="flex items-center gap-2">
+            <Dialog open={isBulkUpdateOpen} onOpenChange={setIsBulkUpdateOpen}>
+              <DialogTrigger asChild>
+                <Button 
+                  variant="outline" 
+                  className={`gap-2 border-indigo-200 text-indigo-700 hover:bg-indigo-50 ${selectedIds.size > 0 ? 'bg-indigo-50 ring-2 ring-indigo-500 ring-offset-2' : ''}`}
+                >
+                  <Settings2 className="w-4 h-4" />
+                  Bulk Update {selectedIds.size > 0 ? `(${selectedIds.size})` : ''}
+                </Button>
+              </DialogTrigger>
+              <DialogContent className="sm:max-w-[425px]">
+                <DialogHeader>
+                  <DialogTitle>Bulk Update Extra Time</DialogTitle>
+                  <p className="text-sm text-slate-500">
+                    Apply these settings to {selectedIds.size > 0 ? `${selectedIds.size} selected` : 'all'} employees.
+                  </p>
+                </DialogHeader>
+                <div className="grid gap-4 py-4">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Extra Working Days</label>
+                    <Input 
+                      type="number" 
+                      value={bulkData.extraWorkingDays} 
+                      onChange={e => setBulkData({...bulkData, extraWorkingDays: parseInt(e.target.value) || 0})} 
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Extra Hours</label>
+                    <Input 
+                      type="number" 
+                      value={bulkData.extraHours} 
+                      onChange={e => setBulkData({...bulkData, extraHours: parseInt(e.target.value) || 0})} 
+                    />
+                  </div>
+                </div>
+                <DialogFooter className="flex flex-col sm:flex-row gap-2">
+                  <Button variant="ghost" onClick={() => setIsBulkUpdateOpen(false)} disabled={isUpdating}>Cancel</Button>
+                  <div className="flex gap-2 w-full sm:w-auto">
+                    <Button 
+                      variant="outline" 
+                      className="flex-1 sm:flex-none gap-2" 
+                      onClick={() => handleBulkUpdate(true)}
+                      disabled={isUpdating}
+                    >
+                      <Users className="w-4 h-4" />
+                      Apply to All
+                    </Button>
+                    <Button 
+                      className="flex-1 sm:flex-none gap-2 bg-indigo-600 hover:bg-indigo-700" 
+                      onClick={() => handleBulkUpdate(false)}
+                      disabled={isUpdating || selectedIds.size === 0}
+                    >
+                      <Zap className="w-4 h-4" />
+                      Apply to Selected
+                    </Button>
+                  </div>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
             <Dialog open={isClearDialogOpen} onOpenChange={setIsClearDialogOpen}>
               <DialogTrigger asChild>
                 <Button 
@@ -331,8 +491,8 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
                       value={newEmployee.gender}
                       onChange={e => setNewEmployee({...newEmployee, gender: e.target.value})}
                     >
-                      <option value="L">L (Male)</option>
-                      <option value="P">P (Female)</option>
+                      <option value="L">L (Laki-laki / Male)</option>
+                      <option value="P">P (Perempuan / Female)</option>
                     </select>
                   </div>
                   <div className="space-y-2">
@@ -351,6 +511,48 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
                       value={newEmployee.email} 
                       onChange={e => setNewEmployee({...newEmployee, email: e.target.value})} 
                     />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Extra Working Days</label>
+                    <Input 
+                      type="number" 
+                      placeholder="0" 
+                      value={newEmployee.extraWorkingDays} 
+                      onChange={e => setNewEmployee({...newEmployee, extraWorkingDays: parseInt(e.target.value) || 0})} 
+                    />
+                  </div>
+                  <div className="space-y-2 col-span-2">
+                    <label className="text-sm font-medium">Extra Hours</label>
+                    <Input 
+                      type="number" 
+                      placeholder="0" 
+                      value={newEmployee.extraHours} 
+                      onChange={e => setNewEmployee({...newEmployee, extraHours: parseInt(e.target.value) || 0})} 
+                    />
+                  </div>
+                  
+                  <div className="space-y-2 col-span-2 border-t pt-4">
+                    <label className="text-sm font-bold text-slate-700 uppercase tracking-wider">Shift Preferences / Restrictions</label>
+                    <p className="text-xs text-slate-500 pb-2">Select shifts this employee is allowed to work. Leave empty for all shifts.</p>
+                    <div className="grid grid-cols-3 gap-2 max-h-32 overflow-y-auto p-2 border rounded-md bg-slate-50/50">
+                      {shiftCodes.map(sc => (
+                        <div key={sc.id} className="flex items-center space-x-2">
+                          <Checkbox 
+                            id={`pref-${sc.id}`} 
+                            checked={newEmployee.preferredShifts?.includes(sc.code)}
+                            onCheckedChange={(checked) => {
+                              const current = newEmployee.preferredShifts || [];
+                              if (checked) {
+                                setNewEmployee({...newEmployee, preferredShifts: [...current, sc.code]});
+                              } else {
+                                setNewEmployee({...newEmployee, preferredShifts: current.filter(c => c !== sc.code)});
+                              }
+                            }}
+                          />
+                          <Label htmlFor={`pref-${sc.id}`} className="text-xs cursor-pointer">{sc.code}</Label>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </div>
                 <DialogFooter>
@@ -379,25 +581,42 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
           <Table>
             <TableHeader className="bg-slate-50/50">
               <TableRow>
+                {isAdmin && (
+                  <TableHead className="w-12">
+                    <Checkbox 
+                      checked={selectedIds.size === filteredEmployees.length && filteredEmployees.length > 0}
+                      onCheckedChange={toggleSelectAll}
+                    />
+                  </TableHead>
+                )}
                 <TableHead>NIP</TableHead>
                 <TableHead>Name</TableHead>
                 <TableHead>Skill</TableHead>
                 <TableHead>Channel</TableHead>
                 <TableHead>Site</TableHead>
                 <TableHead>Gender</TableHead>
+                <TableHead>Extra D/H</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {filteredEmployees.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={7} className="h-32 text-center text-slate-500">
+                  <TableCell colSpan={isAdmin ? 9 : 8} className="h-32 text-center text-slate-500">
                     No employees found.
                   </TableCell>
                 </TableRow>
               ) : (
                 filteredEmployees.map((emp) => (
-                  <TableRow key={emp.id} className="hover:bg-slate-50/50 transition-colors">
+                  <TableRow key={emp.id} className={`hover:bg-slate-50/50 transition-colors ${selectedIds.has(emp.id) ? 'bg-indigo-50/30' : ''}`}>
+                    {isAdmin && (
+                      <TableCell>
+                        <Checkbox 
+                          checked={selectedIds.has(emp.id)}
+                          onCheckedChange={() => toggleSelect(emp.id)}
+                        />
+                      </TableCell>
+                    )}
                     <TableCell className="font-mono text-xs">{emp.nip}</TableCell>
                     <TableCell>
                       <div className="flex flex-col">
@@ -413,17 +632,37 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
                     <TableCell className="text-slate-600 text-sm">{emp.channel || '-'}</TableCell>
                     <TableCell className="text-slate-600 text-sm">{emp.site || '-'}</TableCell>
                     <TableCell className="text-slate-600 text-sm">{emp.gender || '-'}</TableCell>
+                    <TableCell>
+                      <div className="flex flex-col gap-1">
+                        {emp.extraWorkingDays ? <Badge variant="outline" className="text-[10px] text-indigo-600 border-indigo-100">+{emp.extraWorkingDays} Days</Badge> : null}
+                        {emp.extraHours ? <Badge variant="outline" className="text-[10px] text-blue-600 border-blue-100">+{emp.extraHours} Hours</Badge> : null}
+                        {!emp.extraWorkingDays && !emp.extraHours && <span className="text-slate-300 text-[10px]">None</span>}
+                      </div>
+                    </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-2">
                         {isAdmin && (
-                          <Button 
-                            variant="ghost" 
-                            size="icon" 
-                            className="text-slate-400 hover:text-destructive"
-                            onClick={() => handleDeleteEmployee(emp.id)}
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </Button>
+                          <>
+                            <Button 
+                              variant="ghost" 
+                              size="icon" 
+                              className="text-slate-400 hover:text-indigo-600"
+                              onClick={() => {
+                                setEditingEmployee({ ...emp, preferredShifts: emp.preferredShifts || [] });
+                                setIsEditDialogOpen(true);
+                              }}
+                            >
+                              <Edit2 className="w-4 h-4" />
+                            </Button>
+                            <Button 
+                              variant="ghost" 
+                              size="icon" 
+                              className="text-slate-400 hover:text-destructive"
+                              onClick={() => handleDeleteEmployee(emp.id)}
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </Button>
+                          </>
                         )}
                       </div>
                     </TableCell>
@@ -434,6 +673,91 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
           </Table>
         </CardContent>
       </Card>
+
+      <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit Employee: {editingEmployee?.name}</DialogTitle>
+          </DialogHeader>
+          {editingEmployee && (
+            <div className="grid grid-cols-2 gap-4 py-4">
+              <div className="space-y-2">
+                <label className="text-sm font-medium">NIP</label>
+                <Input value={editingEmployee.nip} disabled />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Full Name</label>
+                <Input 
+                  value={editingEmployee.name} 
+                  onChange={e => setEditingEmployee({...editingEmployee, name: e.target.value})} 
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Skill</label>
+                <Input 
+                  value={editingEmployee.skill} 
+                  onChange={e => setEditingEmployee({...editingEmployee, skill: e.target.value})} 
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Extra Working Days</label>
+                <Input 
+                  type="number" 
+                  value={editingEmployee.extraWorkingDays || 0} 
+                  onChange={e => setEditingEmployee({...editingEmployee, extraWorkingDays: parseInt(e.target.value) || 0})} 
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Gender</label>
+                <select 
+                  className="w-full h-10 px-3 rounded-md border border-input bg-background text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                  value={editingEmployee.gender || 'L'}
+                  onChange={e => setEditingEmployee({...editingEmployee, gender: e.target.value})}
+                >
+                  <option value="L">L (Laki-laki / Male)</option>
+                  <option value="P">P (Perempuan / Female)</option>
+                </select>
+              </div>
+              <div className="space-y-2 col-span-2">
+                <label className="text-sm font-medium">Extra Hours</label>
+                <Input 
+                  type="number" 
+                  value={editingEmployee.extraHours || 0} 
+                  onChange={e => setEditingEmployee({...editingEmployee, extraHours: parseInt(e.target.value) || 0})} 
+                />
+              </div>
+
+              <div className="space-y-2 col-span-2 border-t pt-4">
+                <label className="text-sm font-bold text-slate-700 uppercase tracking-wider">Shift Preferences / Restrictions</label>
+                <p className="text-xs text-slate-500 pb-2">Select shifts this employee is allowed to work. Leave empty for all shifts.</p>
+                <div className="grid grid-cols-3 gap-2 max-h-32 overflow-y-auto p-2 border rounded-md bg-slate-50/50">
+                  {shiftCodes.map(sc => (
+                    <div key={sc.id} className="flex items-center space-x-2">
+                      <Checkbox 
+                        id={`edit-pref-${sc.id}`} 
+                        checked={editingEmployee.preferredShifts?.includes(sc.code)}
+                        onCheckedChange={(checked) => {
+                          const current = editingEmployee.preferredShifts || [];
+                          if (checked) {
+                            setEditingEmployee({...editingEmployee, preferredShifts: [...current, sc.code]});
+                          } else {
+                            setEditingEmployee({...editingEmployee, preferredShifts: current.filter(c => c !== sc.code)});
+                          }
+                        }}
+                      />
+                      <Label htmlFor={`edit-pref-${sc.id}`} className="text-xs cursor-pointer">{sc.code}</Label>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setIsEditDialogOpen(false)}>Cancel</Button>
+            <Button onClick={handleUpdateEmployee}>Update Employee</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

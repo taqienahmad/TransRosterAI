@@ -16,7 +16,8 @@
         "religion": { "type": "string", "description": "Religion of the employee." },
         "role": { "type": "string", "description": "Job title or role of the employee." },
         "department": { "type": "string", "description": "Department the employee belongs to." },
-        "skills": { "type": "array", "items": { "type": "string" }, "description": "List of skills the employee possesses." }
+        "skills": { "type": "array", "items": { "type": "string" }, "description": "List of skills the employee possesses." },
+        "preferredShifts": { "type": "array", "items": { "type": "string" }, "description": "List of shift codes this employee prefers or is restricted to." }
       },
       "required": ["name", "nip", "skill"]
     },
@@ -55,7 +56,8 @@
         "code": { "type": "string", "description": "Short code for the shift (e.g., S1, M1)." },
         "name": { "type": "string", "description": "Descriptive name (e.g., Morning Shift)." },
         "startTime": { "type": "string", "description": "Start time in HH:mm format." },
-        "endTime": { "type": "string", "description": "End time in HH:mm format." }
+        "endTime": { "type": "string", "description": "End time in HH:mm format." },
+        "isNightShift": { "type": "boolean", "description": "Flag indicating if this is a night shift." }
       },
       "required": ["code", "name", "startTime", "endTime"]
     },
@@ -71,18 +73,29 @@
       },
       "required": ["date", "day", "totalVolume", "intervals"]
     },
+    "HistoricalVolume": {
+      "title": "Historical Volume",
+      "description": "Represents the historical work volume per interval for a specific date (used for AI training).",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string", "format": "date", "description": "The date in YYYY-MM-DD format." },
+        "day": { "type": "string", "description": "Day of the week (e.g., Mon, Tue)." },
+        "totalVolume": { "type": "number", "description": "Total volume for the day." },
+        "intervals": { "type": "object", "description": "Map of time intervals to volume values." }
+      },
+      "required": ["date", "day", "totalVolume", "intervals"]
+    },
     "WorkingDayRef": {
       "title": "Working Day Reference",
-      "description": "Monthly reference for working days, weekends, and holidays.",
+      "description": "Monthly reference for working days and offdays.",
       "type": "object",
       "properties": {
         "month": { "type": "string", "description": "Month and year (e.g., Jan-25)." },
         "totalDays": { "type": "number", "description": "Total days in the month." },
         "workingDays": { "type": "number", "description": "Number of working days." },
-        "weekend": { "type": "number", "description": "Number of weekend days." },
-        "holiday": { "type": "number", "description": "Number of holidays." }
+        "offday": { "type": "number", "description": "Number of offdays (weekends/holidays)." }
       },
-      "required": ["month", "totalDays", "workingDays", "weekend", "holiday"]
+      "required": ["month", "totalDays", "workingDays", "offday"]
     },
     "ErlangResult": {
       "title": "Erlang Result",
@@ -118,6 +131,22 @@
       "properties": {
         "roster": { "type": "array", "description": "List of employee rosters." }
       }
+    },
+    "LeaveRequest": {
+      "title": "Leave Request",
+      "description": "Represents a request for time off by an employee.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique identifier for the request." },
+        "employeeId": { "type": "string", "description": "ID of the employee." },
+        "employeeName": { "type": "string", "description": "Name of the employee." },
+        "date": { "type": "string", "format": "date", "description": "The date for which leave is requested (YYYY-MM-DD)." },
+        "type": { "type": "string", "enum": ["annual", "sick", "casual", "other"], "description": "Type of leave." },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"], "description": "Current status of the request." },
+        "reason": { "type": "string", "description": "Reason for the leave request." },
+        "submittedAt": { "type": "string", "format": "date-time", "description": "When the request was submitted." }
+      },
+      "required": ["employeeId", "date", "status"]
     }
   },
   "firestore": {
@@ -141,6 +170,10 @@
       "schema": "ForecastVolume",
       "description": "Collection of daily volume data per interval."
     },
+    "/historicalVolume/{date}": {
+      "schema": "HistoricalVolume",
+      "description": "Collection of historical daily volume data per interval."
+    },
     "/workingDaysRef/{month}": {
       "schema": "WorkingDayRef",
       "description": "Collection of monthly working day references."
@@ -156,6 +189,10 @@
     "/roster/{id}": {
       "schema": "Roster",
       "description": "The published roster."
+    },
+    "/leaveRequests/{requestId}": {
+      "schema": "LeaveRequest",
+      "description": "Collection of employee leave requests."
     }
   }
 }

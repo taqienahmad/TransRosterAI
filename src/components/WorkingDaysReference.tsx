@@ -12,8 +12,7 @@ interface WorkingDayRef {
   month: string; // e.g., "Jan-25"
   totalDays: number;
   workingDays: number;
-  weekend: number;
-  holiday: number;
+  offday: number;
 }
 
 export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) {
@@ -57,15 +56,14 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
         // Skip header
         for (let i = 1; i < lines.length; i++) {
           const parts = lines[i].split(separator).map(p => p.trim());
-          if (parts.length >= 5) {
+          if (parts.length >= 4) {
             const month = parts[0];
             const data: WorkingDayRef = {
               id: month,
               month: month,
               totalDays: parseInt(parts[1]) || 0,
               workingDays: parseInt(parts[2]) || 0,
-              weekend: parseInt(parts[3]) || 0,
-              holiday: parseInt(parts[4]) || 0
+              offday: parseInt(parts[3]) || 0
             };
 
             await setDoc(doc(db, 'workingDaysRef', data.id), data);
@@ -92,8 +90,20 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
     }
   };
 
+  const handleClearAll = async () => {
+    if (!isAdmin) return;
+    
+    try {
+      const promises = references.map(ref => deleteDoc(doc(db, 'workingDaysRef', ref.id)));
+      await Promise.all(promises);
+      toast.success('All reference data cleared');
+    } catch (error) {
+      toast.error('Failed to clear data');
+    }
+  };
+
   const downloadTemplate = () => {
-    const csvContent = "Bulan;Total Hari;Working Days;Weekend;Holiday\nJan-25;31;22;8;1\nFeb-25;28;20;8;2";
+    const csvContent = "Bulan;Total Hari;Working Days;Offday\nJan-25;31;22;9\nFeb-25;28;20;8";
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -112,6 +122,10 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
         
         {isAdmin && (
           <div className="flex items-center gap-2">
+            <Button variant="outline" onClick={handleClearAll} className="gap-2 text-rose-600 border-rose-200 hover:bg-rose-50">
+              <Trash2 className="w-4 h-4" />
+              Clear Data
+            </Button>
             <Button variant="outline" onClick={downloadTemplate} className="gap-2">
               <Download className="w-4 h-4" />
               Template
@@ -142,15 +156,14 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
                 <TableHead>Month</TableHead>
                 <TableHead className="text-center">Total Days</TableHead>
                 <TableHead className="text-center">Working Days</TableHead>
-                <TableHead className="text-center">Weekend</TableHead>
-                <TableHead className="text-center">Holiday</TableHead>
+                <TableHead className="text-center">Offday</TableHead>
                 {isAdmin && <TableHead className="text-right">Actions</TableHead>}
               </TableRow>
             </TableHeader>
             <TableBody>
               {references.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={isAdmin ? 6 : 5} className="h-32 text-center text-slate-500">
+                  <TableCell colSpan={isAdmin ? 5 : 4} className="h-32 text-center text-slate-500">
                     No reference data found. Please upload a CSV.
                   </TableCell>
                 </TableRow>
@@ -160,8 +173,7 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
                     <TableCell className="font-bold text-slate-900">{ref.month}</TableCell>
                     <TableCell className="text-center">{ref.totalDays}</TableCell>
                     <TableCell className="text-center font-medium text-emerald-600">{ref.workingDays}</TableCell>
-                    <TableCell className="text-center">{ref.weekend}</TableCell>
-                    <TableCell className="text-center">{ref.holiday}</TableCell>
+                    <TableCell className="text-center">{ref.offday}</TableCell>
                     {isAdmin && (
                       <TableCell className="text-right">
                         <Button 

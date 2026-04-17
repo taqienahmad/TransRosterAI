@@ -12,11 +12,17 @@ import {
   orderBy,
   User,
   doc,
-  getDoc
+  getDoc,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  updateProfile,
+  setDoc
 } from './lib/firebase';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from '@/components/ui/card';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import { Toaster } from '@/components/ui/sonner';
 import { toast } from 'sonner';
 import { 
@@ -27,7 +33,13 @@ import {
   LayoutDashboard,
   Plus,
   Clock,
-  ShieldCheck
+  ShieldCheck,
+  Mail,
+  Lock,
+  User as UserIcon,
+  ArrowRight,
+  Workflow,
+  Sparkles
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -39,17 +51,27 @@ import ShiftCodeManager from './components/ShiftCodeManager';
 import ForecastVolume from './components/ForecastVolume';
 import RosterView from './components/RosterView';
 import WorkingDaysReference from './components/WorkingDaysReference';
+import LeaveManagement from './components/LeaveManagement';
+import SystemArchitecture from './components/SystemArchitecture';
+import PredictiveVolume from './components/PredictiveVolume';
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('forecast-volume');
+  
+  // Auth Form State
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+  const [authLoading, setAuthLoading] = useState(false);
 
   useEffect(() => {
     const handleHashChange = () => {
       const hash = window.location.hash.replace('#', '');
-      if (hash && ['forecast-volume', 'shift-codes', 'employees', 'forecast', 'roster', 'working-days'].includes(hash)) {
+      if (hash && ['forecast-volume', 'shift-codes', 'employees', 'forecast', 'roster', 'working-days', 'leaves', 'architecture', 'predictive-volume'].includes(hash)) {
         setActiveTab(hash);
       }
     };
@@ -84,6 +106,50 @@ export default function App() {
     }
   };
 
+  const handleEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!email || !password) {
+      toast.error('Please fill in all fields');
+      return;
+    }
+
+    setAuthLoading(true);
+    try {
+      if (authMode === 'register') {
+        if (!displayName) {
+          toast.error('Please enter your name');
+          setAuthLoading(false);
+          return;
+        }
+        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        await updateProfile(userCredential.user, { displayName });
+        
+        // Create user profile in Firestore
+        await setDoc(doc(db, 'users', userCredential.user.uid), {
+          uid: userCredential.user.uid,
+          email: userCredential.user.email,
+          displayName,
+          role: 'staff', // Default role
+          createdAt: new Date().toISOString()
+        });
+        
+        toast.success('Account created successfully!');
+      } else {
+        await signInWithEmailAndPassword(auth, email, password);
+        toast.success('Welcome back!');
+      }
+    } catch (error: any) {
+      console.error(error);
+      let message = 'Authentication failed';
+      if (error.code === 'auth/email-already-in-use') message = 'Email already in use';
+      if (error.code === 'auth/invalid-credential') message = 'Invalid email or password';
+      if (error.code === 'auth/weak-password') message = 'Password should be at least 6 characters';
+      toast.error(message);
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
   const handleLogout = async () => {
     try {
       await signOut(auth);
@@ -114,8 +180,8 @@ export default function App() {
           animate={{ opacity: 1, y: 0 }}
           className="max-w-md w-full"
         >
-          <Card className="border-none shadow-xl bg-white/80 backdrop-blur-sm">
-            <CardHeader className="text-center space-y-4">
+          <Card className="border-none shadow-xl bg-white/80 backdrop-blur-sm overflow-hidden">
+            <CardHeader className="text-center space-y-4 pb-2">
               <div className="mx-auto w-16 h-16 bg-primary/10 rounded-2xl flex items-center justify-center">
                 <Clock className="w-8 h-8 text-primary" />
               </div>
@@ -125,18 +191,122 @@ export default function App() {
                   <span className="text-3xl font-bold tracking-tight bg-gradient-to-r from-primary to-indigo-600 bg-clip-text text-transparent">TransRosterAI</span>
                 </div>
                 <CardDescription className="text-slate-500 text-base">
-                  Intelligent employee forecasting and scheduling for modern teams.
+                  Intelligent employee forecasting and scheduling.
                 </CardDescription>
               </div>
             </CardHeader>
-            <CardContent className="space-y-4">
-              <Button onClick={handleLogin} className="w-full h-12 text-lg font-medium" size="lg">
+            
+            <CardContent className="space-y-6 pt-6">
+              <Tabs value={authMode} onValueChange={(v) => setAuthMode(v as any)} className="w-full">
+                <TabsList className="grid w-full grid-cols-2 mb-6">
+                  <TabsTrigger value="login">Login</TabsTrigger>
+                  <TabsTrigger value="register">Register</TabsTrigger>
+                </TabsList>
+                
+                <form onSubmit={handleEmailAuth} className="space-y-4">
+                  {authMode === 'register' && (
+                    <div className="space-y-2">
+                      <Label htmlFor="name">Full Name</Label>
+                      <div className="relative">
+                        <UserIcon className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                        <Input 
+                          id="name" 
+                          placeholder="John Doe" 
+                          className="pl-10"
+                          value={displayName}
+                          onChange={(e) => setDisplayName(e.target.value)}
+                          required
+                        />
+                      </div>
+                    </div>
+                  )}
+                  
+                  <div className="space-y-2">
+                    <Label htmlFor="email">Email Address</Label>
+                    <div className="relative">
+                      <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                      <Input 
+                        id="email" 
+                        type="email" 
+                        placeholder="name@example.com" 
+                        className="pl-10"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        required
+                      />
+                    </div>
+                  </div>
+                  
+                  <div className="space-y-2">
+                    <Label htmlFor="password">Password</Label>
+                    <div className="relative">
+                      <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                      <Input 
+                        id="password" 
+                        type="password" 
+                        placeholder="••••••••" 
+                        className="pl-10"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        required
+                      />
+                    </div>
+                  </div>
+                  
+                  <Button type="submit" className="w-full h-11 text-base font-medium" disabled={authLoading}>
+                    {authLoading ? 'Processing...' : (authMode === 'login' ? 'Sign In' : 'Create Account')}
+                  </Button>
+                </form>
+              </Tabs>
+
+              <div className="relative">
+                <div className="absolute inset-0 flex items-center">
+                  <span className="w-full border-t border-slate-200" />
+                </div>
+                <div className="relative flex justify-center text-xs uppercase">
+                  <span className="bg-white px-2 text-slate-400">Or continue with</span>
+                </div>
+              </div>
+
+              <Button variant="outline" onClick={handleLogin} className="w-full h-11 text-base font-medium border-slate-200 hover:bg-slate-50" disabled={authLoading}>
                 Sign in with Google
               </Button>
-              <p className="text-xs text-center text-slate-400">
-                Secure authentication powered by Firebase
-              </p>
             </CardContent>
+            
+            <CardFooter className="bg-slate-50/50 border-t border-slate-100 p-4 flex flex-col gap-3">
+              <div className="w-full">
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 text-center">Demo Accounts (Quick Setup)</p>
+                <div className="grid grid-cols-2 gap-2">
+                  <Button 
+                    variant="ghost" 
+                    size="sm" 
+                    className="text-[11px] h-8 bg-white border border-slate-200 hover:bg-indigo-50 hover:text-indigo-600"
+                    onClick={() => {
+                      setEmail('admin@transroster.ai');
+                      setPassword('admin123');
+                      setAuthMode('login');
+                    }}
+                  >
+                    Admin Demo
+                  </Button>
+                  <Button 
+                    variant="ghost" 
+                    size="sm" 
+                    className="text-[11px] h-8 bg-white border border-slate-200 hover:bg-indigo-50 hover:text-indigo-600"
+                    onClick={() => {
+                      setEmail('staff@transroster.ai');
+                      setPassword('staff123');
+                      setAuthMode('login');
+                    }}
+                  >
+                    Staff Demo
+                  </Button>
+                </div>
+              </div>
+              <p className="text-[10px] text-center text-slate-400 px-4 leading-relaxed">
+                Note: To use Email/Password, ensure it is enabled in your Firebase Console under Authentication → Sign-in method.
+              </p>
+            </CardFooter>
           </Card>
         </motion.div>
       </div>
@@ -165,6 +335,12 @@ export default function App() {
             onClick={() => { setActiveTab('forecast-volume'); window.location.hash = 'forecast-volume'; }} 
           />
           <SidebarItem 
+            icon={<Sparkles className="w-5 h-5" />} 
+            label="Predictive AI" 
+            active={activeTab === 'predictive-volume'} 
+            onClick={() => { setActiveTab('predictive-volume'); window.location.hash = 'predictive-volume'; }} 
+          />
+          <SidebarItem 
             icon={<Clock className="w-5 h-5" />} 
             label="Shift Codes" 
             active={activeTab === 'shift-codes'} 
@@ -175,6 +351,12 @@ export default function App() {
             label="Employees" 
             active={activeTab === 'employees'} 
             onClick={() => { setActiveTab('employees'); window.location.hash = 'employees'; }} 
+          />
+          <SidebarItem 
+            icon={<Clock className="w-5 h-5" />} 
+            label="Leave Requests" 
+            active={activeTab === 'leaves'} 
+            onClick={() => { setActiveTab('leaves'); window.location.hash = 'leaves'; }} 
           />
           <SidebarItem 
             icon={<Calendar className="w-5 h-5" />} 
@@ -193,6 +375,12 @@ export default function App() {
             label="Roster" 
             active={activeTab === 'roster'} 
             onClick={() => { setActiveTab('roster'); window.location.hash = 'roster'; }} 
+          />
+          <SidebarItem 
+            icon={<Workflow className="w-5 h-5" />} 
+            label="System Architecture" 
+            active={activeTab === 'architecture'} 
+            onClick={() => { setActiveTab('architecture'); window.location.hash = 'architecture'; }} 
           />
         </nav>
 
@@ -233,6 +421,9 @@ export default function App() {
           <div className={activeTab === 'forecast-volume' ? 'block' : 'hidden'}>
             <ForecastVolume isAdmin={isAdmin} />
           </div>
+          <div className={activeTab === 'predictive-volume' ? 'block' : 'hidden'}>
+            <PredictiveVolume isAdmin={isAdmin} />
+          </div>
           <div className={activeTab === 'shift-codes' ? 'block' : 'hidden'}>
             <ShiftCodeManager isAdmin={isAdmin} />
           </div>
@@ -247,6 +438,12 @@ export default function App() {
           </div>
           <div className={activeTab === 'roster' ? 'block' : 'hidden'}>
             <RosterView isAdmin={isAdmin} />
+          </div>
+          <div className={activeTab === 'leaves' ? 'block' : 'hidden'}>
+            <LeaveManagement isAdmin={isAdmin} />
+          </div>
+          <div className={activeTab === 'architecture' ? 'block' : 'hidden'}>
+            <SystemArchitecture />
           </div>
         </div>
       </main>

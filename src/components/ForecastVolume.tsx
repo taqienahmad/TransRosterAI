@@ -76,24 +76,69 @@ export default function ForecastVolume({ isAdmin }: { isAdmin: boolean }) {
           return;
         }
 
-        const datesRow = dataMatrix[0];
-        const daysRow = dataMatrix[1];
-        const totalVolumeRow = dataMatrix[2];
-        const intervalRows = dataMatrix.slice(3);
+        const datesIdx = dataMatrix.findIndex(row => row[0]?.toLowerCase().includes('date'));
+        const daysIdx = dataMatrix.findIndex(row => row[0]?.toLowerCase().includes('day'));
+        const totalVolumeIdx = dataMatrix.findIndex(row => row[0]?.toLowerCase().includes('volume'));
 
-        if (!datesRow[0].toLowerCase().includes('date')) {
-          toast.error('First row must start with "Dates"');
-          console.log('First row first cell:', datesRow[0]);
+        if (datesIdx === -1 || totalVolumeIdx === -1) {
+          toast.error('Invalid format. Could not find "Dates" or "Total Volume" rows.');
           return;
         }
 
+        const datesRow = dataMatrix[datesIdx];
+        const daysRow = daysIdx !== -1 ? dataMatrix[daysIdx] : [];
+        const totalVolumeRow = dataMatrix[totalVolumeIdx];
+        
+        // Interval rows are everything else that isn't one of the headers
+        const intervalRows = dataMatrix.filter((_, idx) => 
+          idx !== datesIdx && idx !== daysIdx && idx !== totalVolumeIdx
+        );
+
+        const parseNumber = (val: string): number => {
+          if (!val) return 0;
+          let s = val.trim().replace(/\s/g, '');
+          
+          // Handle cases like 1.234,56 or 1,234.56
+          if (s.includes(',') && s.includes('.')) {
+            const lastComma = s.lastIndexOf(',');
+            const lastDot = s.lastIndexOf('.');
+            if (lastComma > lastDot) {
+              // Dot is thousands, comma is decimal
+              return parseFloat(s.replace(/\./g, '').replace(',', '.')) || 0;
+            } else {
+              // Comma is thousands, dot is decimal
+              return parseFloat(s.replace(/,/g, '')) || 0;
+            }
+          }
+          
+          // If only comma exists, assume it's a thousands separator or decimal
+          if (s.includes(',')) {
+            const parts = s.split(',');
+            if (parts.length > 2 || (parts.length === 2 && parts[1].length === 3)) {
+              return parseFloat(s.replace(/,/g, '')) || 0;
+            }
+            return parseFloat(s.replace(',', '.')) || 0;
+          }
+          
+          // If only dot exists, it's the most ambiguous case (1.482)
+          if (s.includes('.')) {
+            const parts = s.split('.');
+            if (parts.length > 2 || (parts.length === 2 && parts[1].length === 3)) {
+              return parseFloat(s.replace(/\./g, '')) || 0;
+            }
+          }
+          
+          return parseFloat(s) || 0;
+        };
+
         let successCount = 0;
         let errorCount = 0;
+        let suspiciouslyLowCount = 0;
 
         // Iterate through columns (starting from index 1)
         for (let col = 1; col < datesRow.length; col++) {
           const rawDate = datesRow[col];
-          if (!rawDate || rawDate.toLowerCase() === 'dates') continue;
+          if (!rawDate) continue;
 
           try {
             // Convert DD/MM/YYYY to YYYY-MM-DD
@@ -101,7 +146,6 @@ export default function ForecastVolume({ isAdmin }: { isAdmin: boolean }) {
             if (rawDate.includes('/')) {
               const parts = rawDate.split('/');
               if (parts.length === 3) {
-                // Handle both DD/MM/YYYY and YYYY/MM/DD
                 if (parts[0].length === 4) {
                   dateStr = `${parts[0]}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
                 } else {
@@ -119,20 +163,21 @@ export default function ForecastVolume({ isAdmin }: { isAdmin: boolean }) {
               }
             }
 
-            if (!dateStr) {
-              console.warn('Invalid date format in column:', col, rawDate);
-              continue;
-            }
+            if (!dateStr) continue;
 
             const day = daysRow[col] || '';
-            const totalVolume = parseFloat(totalVolumeRow[col]?.replace(/,/g, '')) || 0;
+            const totalVolume = parseNumber(totalVolumeRow[col]);
+            
+            if (totalVolume > 0 && totalVolume < 10) {
+              suspiciouslyLowCount++;
+            }
+
             const intervals: Record<string, number> = {};
 
             intervalRows.forEach(row => {
               const intervalName = row[0];
-              if (intervalName && !['dates', 'days', 'total volume'].includes(intervalName.toLowerCase())) {
-                const valStr = row[col]?.replace(/,/g, '') || '0';
-                const intervalValue = parseFloat(valStr) || 0;
+              if (intervalName) {
+                const intervalValue = parseNumber(row[col]);
                 intervals[intervalName] = intervalValue;
               }
             });
@@ -152,6 +197,9 @@ export default function ForecastVolume({ isAdmin }: { isAdmin: boolean }) {
 
         if (successCount > 0) {
           toast.success(`Successfully uploaded ${successCount} days of volume data`);
+          if (suspiciouslyLowCount > successCount / 2) {
+            toast.warning('Warning: Detected very low volume values. Please check if your thousands separators (dots/commas) were parsed correctly.', { duration: 6000 });
+          }
         } else {
           toast.error('No valid data columns found. Check date format (DD/MM/YYYY).');
         }

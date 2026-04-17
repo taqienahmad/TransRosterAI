@@ -1,22 +1,30 @@
-import React, { useState, useEffect } from 'react';
-import { db, collection, onSnapshot, query, setDoc, doc, OperationType, handleFirestoreError } from '../lib/firebase';
+import React, { useState, useEffect, useMemo } from 'react';
+import { db, collection, onSnapshot, query, setDoc, doc, OperationType, handleFirestoreError, auth, where } from '../lib/firebase';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Calendar as CalendarIcon, Users, Download, RefreshCw, CheckCircle2, AlertCircle, Clock, Sparkles, TrendingUp, Activity, Target, ShieldCheck, Zap, Heart, BarChart3, ClipboardCheck, Edit2, ListChecks, ArrowRight } from 'lucide-react';
+import { Input } from '@/components/ui/input';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from '@/components/ui/dialog';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Calendar as CalendarIcon, Users, Download, RefreshCw, CheckCircle2, AlertCircle, Clock, Sparkles, TrendingUp, Activity, Target, ShieldCheck, Zap, Heart, BarChart3, ClipboardCheck, Edit2, ListChecks, ArrowRight, AlertTriangle, Settings2, Search } from 'lucide-react';
 import { toast } from 'sonner';
 import { format, startOfWeek, addDays, isSameDay } from 'date-fns';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import { ShiftCode } from './ShiftCodeManager';
-import { calculateRequiredAgents } from '../lib/erlang';
+import { calculateRequiredAgents, calculateRequiredAgentsChat, calculateRequiredAgentsEmail, getIntervalDuration, isIntervalInWindow, matchDayName, applyOperationalWindowsToVolume } from '../lib/erlang';
+import { writeBatch } from '../lib/firebase';
 
 interface Employee {
   id: string;
   nip: string;
   name: string;
   skill: string;
+  gender?: string;
+  preferredShifts?: string[];
+  extraWorkingDays?: number;
+  extraHours?: number;
 }
 
 interface ForecastVolumeData {
@@ -35,11 +43,14 @@ interface EmployeeRoster {
   employeeId: string;
   employeeName: string;
   nip: string;
+  gender?: string;
+  preferredShifts?: string[];
   days: Record<string, string>; // date -> shiftCode
   totalWorkingDays: number;
   totalOffDays: number;
   targetWorkingDays: number;
   targetOffDays: number;
+  extraHours?: number;
 }
 
 interface WorkingDayRef {
@@ -51,11 +62,21 @@ interface WorkingDayRef {
   holiday: number;
 }
 
+interface LeaveRequest {
+  id: string;
+  employeeId: string;
+  employeeName: string;
+  date: string;
+  status: 'pending' | 'approved' | 'rejected';
+}
+
 export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
-  const [volumeData, setVolumeData] = useState<ForecastVolumeData[]>([]);
+  const [allVolumeData, setAllVolumeData] = useState<ForecastVolumeData[]>([]);
+  const [selectedMonth, setSelectedMonth] = useState<string>('');
   const [shiftCodes, setShiftCodes] = useState<ShiftCode[]>([]);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [workingDaysRef, setWorkingDaysRef] = useState<WorkingDayRef[]>([]);
+  const [leaveRequests, setLeaveRequests] = useState<LeaveRequest[]>([]);
   const [roster, setRoster] = useState<EmployeeRoster[]>([]);
   const [loading, setLoading] = useState(false);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
@@ -67,21 +88,146 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
   const [shiftFilter, setShiftFilter] = useState('all');
   const [isEditing, setIsEditing] = useState(false);
   const [showAudit, setShowAudit] = useState(false);
+  const [extraWorkingDays, setExtraWorkingDays] = useState(0);
+  const [extraHours, setExtraHours] = useState(0);
+  
+  // Extra Time Assignment State
+  const [isExtraTimeDialogOpen, setIsExtraTimeDialogOpen] = useState(false);
+  const [assignmentMode, setAssignmentMode] = useState<'all' | 'selected'>('all');
+  const [selectedEmpIds, setSelectedEmpIds] = useState<Set<string>>(new Set());
+  const [tempExtraDays, setTempExtraDays] = useState(0);
+  const [tempExtraHours, setTempExtraHours] = useState(0);
+  const [empSearchTerm, setEmpSearchTerm] = useState('');
+  const [isUpdatingExtra, setIsUpdatingExtra] = useState(false);
+
+  const handleApplyExtraTime = async () => {
+    setIsUpdatingExtra(true);
+    try {
+      if (assignmentMode === 'all') {
+        // Update global settings
+        await updateExtraSettings(tempExtraDays, tempExtraHours);
+        
+        // Also update ALL employees in the database to match this global setting for consistency
+        const batch = writeBatch(db);
+        employees.forEach(emp => {
+          const ref = doc(db, 'employees', emp.id);
+          batch.update(ref, {
+            extraWorkingDays: tempExtraDays,
+            extraHours: tempExtraHours
+          });
+        });
+        await batch.commit();
+        toast.success(`Applied ${tempExtraDays}d / ${tempExtraHours}h to all ${employees.length} staff`);
+      } else {
+        // Update only selected employees
+        const batch = writeBatch(db);
+        const selectedCount = selectedEmpIds.size;
+        
+        if (selectedCount === 0) {
+          toast.error('No staff selected');
+          setIsUpdatingExtra(false);
+          return;
+        }
+
+        selectedEmpIds.forEach(id => {
+          const ref = doc(db, 'employees', id);
+          batch.update(ref, {
+            extraWorkingDays: tempExtraDays,
+            extraHours: tempExtraHours
+          });
+        });
+        
+        await batch.commit();
+        toast.success(`Applied ${tempExtraDays}d / ${tempExtraHours}h to ${selectedCount} selected staff`);
+      }
+      setIsExtraTimeDialogOpen(false);
+    } catch (error) {
+      console.error(error);
+      toast.error('Failed to update extra time settings');
+    } finally {
+      setIsUpdatingExtra(false);
+    }
+  };
+
+  const toggleEmpSelect = (id: string) => {
+    const newSet = new Set(selectedEmpIds);
+    if (newSet.has(id)) newSet.delete(id);
+    else newSet.add(id);
+    setSelectedEmpIds(newSet);
+  };
+
+  const toggleSelectAllEmps = () => {
+    if (selectedEmpIds.size === employees.length) {
+      setSelectedEmpIds(new Set());
+    } else {
+      setSelectedEmpIds(new Set(employees.map(e => e.id)));
+    }
+  };
+
+  const updateExtraSettings = async (days: number, hours: number) => {
+    setExtraWorkingDays(days);
+    setExtraHours(hours);
+    try {
+      await setDoc(doc(db, 'erlangSettings', 'current'), { 
+        extraWorkingDays: days, 
+        extraHours: hours 
+      }, { merge: true });
+    } catch (error) {
+      console.error("Failed to save extra settings:", error);
+    }
+  };
+
+  const availableMonths = useMemo(() => {
+    const months = new Set<string>();
+    allVolumeData.forEach(d => {
+      try {
+        months.add(format(new Date(d.date), 'MMM-yy'));
+      } catch (e) {
+        console.error("Invalid date in volume data:", d.date);
+      }
+    });
+    return Array.from(months).sort((a, b) => {
+      // Parse MMM-yy to date for sorting
+      const [m, y] = a.split('-');
+      const [m2, y2] = b.split('-');
+      const dateA = new Date(2000 + parseInt(y), ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'].indexOf(m));
+      const dateB = new Date(2000 + parseInt(y2), ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'].indexOf(m2));
+      return dateA.getTime() - dateB.getTime();
+    });
+  }, [allVolumeData]);
+
+  const volumeData = useMemo(() => {
+    if (!selectedMonth) return allVolumeData;
+    return allVolumeData.filter(d => format(new Date(d.date), 'MMM-yy') === selectedMonth);
+  }, [allVolumeData, selectedMonth]);
+
+  useEffect(() => {
+    if (availableMonths.length > 0 && !selectedMonth) {
+      setSelectedMonth(availableMonths[0]);
+    }
+  }, [availableMonths, selectedMonth]);
+
+  useEffect(() => {
+    if (selectedMonth && volumeData.length > 0) {
+      const isCurrentDateInMonth = volumeData.some(d => d.date === selectedDateForAnalysis);
+      if (!isCurrentDateInMonth) {
+        setSelectedDateForAnalysis(volumeData[0].date);
+      }
+    }
+  }, [selectedMonth, volumeData, selectedDateForAnalysis]);
 
   // Helper: Calculate rest hours between two shifts
-  const getRestHours = (prevShift: ShiftCode, nextShift: ShiftCode) => {
+  const getRestHours = (prevShift: ShiftCode, nextShift: ShiftCode, extra: number = 0) => {
     const [prevEndH, prevEndM] = prevShift.endTime.split(':').map(Number);
     const [nextStartH, nextStartM] = nextShift.startTime.split(':').map(Number);
     
-    let endTotalMinutes = prevEndH * 60 + prevEndM;
+    let endTotalMinutes = prevEndH * 60 + prevEndM + (extra * 60);
     let startTotalMinutes = nextStartH * 60 + nextStartM;
     
-    // If prev shift ends after midnight (e.g. 06:00), it's already in the "next day"
-    // but for the purpose of rest calculation, we treat the next shift as being 24h later
     const [prevStartH] = prevShift.startTime.split(':').map(Number);
     if (prevEndH < prevStartH) {
        // Overnight shift
-       return startTotalMinutes - endTotalMinutes;
+       return startTotalMinutes - (endTotalMinutes - 1440);
     }
     
     // Normal shift: rest is (24h - end) + start
@@ -92,9 +238,10 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
     employeeId: string;
     employeeName: string;
     date: string;
-    type: 'REST' | 'CONSECUTIVE';
+    type: 'REST' | 'CONSECUTIVE' | 'JUMP';
     details: string;
     suggestion: string;
+    currentShift: string;
   }
 
   const getRosterViolations = (): Violation[] => {
@@ -102,22 +249,23 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
     
     roster.forEach(emp => {
       let consecutive = 0;
+      const empExtraHours = emp.extraHours !== undefined ? emp.extraHours : extraHours;
       
       volumeData.forEach((day, idx) => {
-        const shift = emp.days[day.date];
+        const shift = emp.days[day.date] || 'OFF';
         
-        if (shift && shift !== 'OFF') {
+        if (shift !== 'OFF') {
           consecutive++;
           
           // Check Rest Violation
           if (idx > 0) {
             const prevDate = volumeData[idx - 1].date;
-            const prevShift = emp.days[prevDate];
-            if (prevShift && prevShift !== 'OFF') {
+            const prevShift = emp.days[prevDate] || 'OFF';
+            if (prevShift !== 'OFF') {
               const sPrev = shiftCodes.find(sc => sc.code === prevShift);
               const sCurr = shiftCodes.find(sc => sc.code === shift);
               if (sPrev && sCurr) {
-                const restMins = getRestHours(sPrev, sCurr);
+                const restMins = getRestHours(sPrev, sCurr, empExtraHours);
                 if (restMins < 11 * 60) {
                   violations.push({
                     employeeId: emp.employeeId,
@@ -125,8 +273,24 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                     date: day.date,
                     type: 'REST',
                     details: `Only ${Math.round(restMins/60*10)/10}h rest between ${prevShift} and ${shift}`,
-                    suggestion: `Change ${day.date} to an earlier shift or move to a day after an OFF day.`
+                    suggestion: `Change ${day.date} to an earlier shift or move to a day after an OFF day.`,
+                    currentShift: shift
                   });
+                } else {
+                  // Check for "Jump" (Backward Rotation) even if rest is legal
+                  const [prevStartH] = sPrev.startTime.split(':').map(Number);
+                  const [currStartH] = sCurr.startTime.split(':').map(Number);
+                  if (currStartH < prevStartH) {
+                    violations.push({
+                      employeeId: emp.employeeId,
+                      employeeName: emp.employeeName,
+                      date: day.date,
+                      type: 'JUMP',
+                      details: `Backward shift rotation (Jump) from ${prevShift} to ${shift}`,
+                      suggestion: `Not recommended: This reduces jumping accuracy and employee comfort. Consider swapping with a later shift.`,
+                      currentShift: shift
+                    });
+                  }
                 }
               }
             }
@@ -140,7 +304,8 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
               date: day.date,
               type: 'CONSECUTIVE',
               details: `${consecutive} consecutive working days`,
-              suggestion: `Change ${day.date} to OFF and assign to an employee with fewer working days.`
+              suggestion: `Change ${day.date} to OFF and assign to an employee with fewer working days.`,
+              currentShift: shift
             });
           }
         } else {
@@ -190,7 +355,103 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
     }
   };
 
-  const getShiftBadgeClasses = (code: string, isRestViolation: boolean, isConsecViolation: boolean) => {
+  const handleQuickFix = (v: Violation) => {
+    if (v.type === 'REST' || v.type === 'JUMP') {
+      const dayIdx = volumeData.findIndex(d => d.date === v.date);
+      if (dayIdx > 0) {
+        const prevDate = volumeData[dayIdx - 1].date;
+        const emp = roster.find(e => e.employeeId === v.employeeId);
+        if (emp) {
+          const prevShift = emp.days[prevDate] || 'OFF';
+          if (prevShift !== 'OFF') {
+            const sPrev = shiftCodes.find(sc => sc.code === prevShift);
+            if (sPrev) {
+              // Find first shift that gives 11h rest and is NOT a jump if possible
+              const [prevStartH] = sPrev.startTime.split(':').map(Number);
+              const empExtraHours = emp.extraHours !== undefined ? emp.extraHours : extraHours;
+              const safeShifts = shiftCodes.filter(sc => getRestHours(sPrev, sc, empExtraHours) >= 11 * 60);
+              
+              // Prefer non-jump
+              const bestShift = safeShifts.find(sc => {
+                const [currStartH] = sc.startTime.split(':').map(Number);
+                return currStartH >= prevStartH;
+              }) || safeShifts[0];
+
+              if (bestShift) {
+                handleManualShiftChange(v.employeeId, v.date, bestShift.code);
+                return;
+              }
+            }
+          }
+        }
+      }
+    } else if (v.type === 'CONSECUTIVE') {
+      handleManualShiftChange(v.employeeId, v.date, 'OFF');
+      return;
+    }
+    toast.info("No automatic fix available. Please adjust manually.");
+  };
+
+  const handleBulkFix = async () => {
+    if (violations.length === 0) return;
+    
+    setLoading(true);
+    try {
+      let updatedRoster = [...roster];
+      
+      for (const v of violations) {
+        const empIdx = updatedRoster.findIndex(e => e.employeeId === v.employeeId);
+        if (empIdx === -1) continue;
+        
+        const emp = updatedRoster[empIdx];
+        const dayIdx = volumeData.findIndex(d => d.date === v.date);
+        
+        if (v.type === 'REST' || v.type === 'JUMP') {
+          if (dayIdx > 0) {
+            const prevDate = volumeData[dayIdx - 1].date;
+            const prevShift = emp.days[prevDate] || 'OFF';
+            if (prevShift !== 'OFF') {
+              const sPrev = shiftCodes.find(sc => sc.code === prevShift);
+              if (sPrev) {
+                const [prevStartH] = sPrev.startTime.split(':').map(Number);
+                const empExtraHours = emp.extraHours !== undefined ? emp.extraHours : extraHours;
+                const safeShifts = shiftCodes.filter(sc => getRestHours(sPrev, sc, empExtraHours) >= 11 * 60);
+                
+                const bestShift = safeShifts.find(sc => {
+                  const [currStartH] = sc.startTime.split(':').map(Number);
+                  return currStartH >= prevStartH;
+                }) || safeShifts[0];
+
+                if (bestShift) {
+                  const newDays = { ...emp.days, [v.date]: bestShift.code };
+                  let working = 0; let off = 0;
+                  Object.values(newDays).forEach(s => { if (s === 'OFF') off++; else working++; });
+                  updatedRoster[empIdx] = { ...emp, days: newDays, totalWorkingDays: working, totalOffDays: off };
+                }
+              }
+            }
+          }
+        } else if (v.type === 'CONSECUTIVE') {
+          const newDays = { ...emp.days, [v.date]: 'OFF' };
+          let working = 0; let off = 0;
+          Object.values(newDays).forEach(s => { if (s === 'OFF') off++; else working++; });
+          updatedRoster[empIdx] = { ...emp, days: newDays, totalWorkingDays: working, totalOffDays: off };
+        }
+      }
+
+      setRoster(updatedRoster);
+      await setDoc(doc(db, 'roster', 'current'), { roster: updatedRoster });
+      toast.success(`Resolved ${violations.length} violations`);
+    } catch (error) {
+      console.error(error);
+      toast.error('Failed to apply bulk fix');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const getShiftBadgeClasses = (code: string, isRestViolation: boolean, isConsecViolation: boolean, isOnLeave: boolean = false) => {
+    if (isOnLeave || code === 'Leave') return 'bg-amber-100 text-amber-800 border-amber-300 ring-1 ring-amber-200';
     if (code === 'OFF') return 'bg-slate-50 text-slate-300 border-slate-100';
     if (isRestViolation || isConsecViolation) {
       if (isRestViolation) return 'bg-red-50 text-red-700 border-red-300 ring-1 ring-red-200';
@@ -209,34 +470,231 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
     return colors[idx % colors.length] || 'bg-indigo-50 text-indigo-700 border-indigo-200';
   };
 
-  // Parameters for Erlang (synced from Firestore)
+  // Parameters for Staffing (synced from Firestore)
+  const [channelType, setChannelType] = useState<'call' | 'chat' | 'email' | 'whatsapp' | 'multiskill_chat_wa'>('call');
   const [aht, setAht] = useState(300);
   const [targetSL, setTargetSL] = useState(0.8);
   const [targetTime, setTargetTime] = useState(20);
+  const [concurrency, setConcurrency] = useState(2);
+  const [tat, setTat] = useState(3600); // 1 hour default for email
   const [shrinkage, setShrinkage] = useState(0.3);
+  const [operationalWindows, setOperationalWindows] = useState<any>({
+    'Monday': { start: '00:00', end: '23:59', isOpen: true },
+    'Tuesday': { start: '00:00', end: '23:59', isOpen: true },
+    'Wednesday': { start: '00:00', end: '23:59', isOpen: true },
+    'Thursday': { start: '00:00', end: '23:59', isOpen: true },
+    'Friday': { start: '00:00', end: '23:59', isOpen: true },
+    'Saturday': { start: '00:00', end: '23:59', isOpen: true },
+    'Sunday': { start: '00:00', end: '23:59', isOpen: true },
+  });
 
-  const { totalDemand, dailyWeights } = React.useMemo(() => {
+  // 0. Pre-process volume data based on operational windows (Carry-over volume)
+  const processedVolume = useMemo(() => {
+    return applyOperationalWindowsToVolume(volumeData, operationalWindows);
+  }, [volumeData, operationalWindows]);
+
+  const { totalDemand, dailyWeights } = useMemo(() => {
     const weights: Record<string, number> = {};
     let total = 0;
-    volumeData.forEach(day => {
+
+    processedVolume.forEach(day => {
       let dayTotalHours = 0;
-      Object.values(day.intervals).forEach(val => {
-        const volume = Number(val) || 0;
-        const res = calculateRequiredAgents(volume, aht, targetSL, targetTime);
-        dayTotalHours += res.agents;
+      let maxAgentsForDay = 0;
+      const allIntervalKeys = Object.keys(day.intervals).sort();
+      
+      Object.entries(day.intervals).forEach(([interval, effectiveVolume]) => {
+        const duration = getIntervalDuration(interval, allIntervalKeys);
+        let res;
+        if (channelType === 'chat' || channelType === 'whatsapp' || channelType === 'multiskill_chat_wa') {
+          res = calculateRequiredAgentsChat(effectiveVolume as number, aht, targetSL, targetTime, concurrency, duration);
+        } else if (channelType === 'email') {
+          res = calculateRequiredAgentsEmail(effectiveVolume as number, aht, targetSL, tat, duration);
+        } else {
+          res = calculateRequiredAgents(effectiveVolume as number, aht, targetSL, targetTime, duration);
+        }
+        dayTotalHours += res.agents * duration;
+        if (res.agents > maxAgentsForDay) maxAgentsForDay = res.agents;
       });
-      const weight = Math.ceil((dayTotalHours / 8) * (1 + shrinkage));
+      
+      const standardShiftLength = 8;
+      // Weights are now the MAX of (total hours/8) OR the peak requirement
+      let weight = Math.max(
+        Math.ceil((dayTotalHours / standardShiftLength) * (1 + shrinkage)),
+        Math.ceil(maxAgentsForDay * (1 + shrinkage))
+      );
+      
+      const dayConfig = matchDayName(day.day, operationalWindows, day.date);
+      if (dayConfig && !dayConfig.isOpen) weight = 0;
+      
       weights[day.date] = weight;
       total += weight;
     });
     return { totalDemand: total, dailyWeights: weights };
-  }, [volumeData, aht, targetSL, targetTime, shrinkage]);
+  }, [processedVolume, aht, targetSL, targetTime, shrinkage, channelType, concurrency, tat]);
+
+  const { targetWorkingDays, targetOffDays, targetHolidays, matchedMonth } = useMemo(() => {
+    let twd = 22;
+    let tod = 9;
+    let th = 0;
+    let mm = "Default (5/7 ratio)";
+    
+    if (volumeData.length > 0) {
+      const firstDate = new Date(volumeData[0].date);
+      const monthStr = format(firstDate, 'MMM-yy');
+      const ref = workingDaysRef.find(r => r.month.toLowerCase() === monthStr.toLowerCase());
+      
+      if (ref) {
+        const scaleFactor = volumeData.length / ref.totalDays;
+        
+        // Intelligent detection: if workingDays + weekend + holiday = totalDays, then workingDays is net.
+        // If workingDays + weekend = totalDays, then workingDays is gross and we subtract holidays.
+        let netWorkingDays = ref.workingDays;
+        if (ref.workingDays + ref.weekend === ref.totalDays && ref.holiday > 0) {
+          netWorkingDays = ref.workingDays - ref.holiday;
+        }
+        
+        twd = Math.round(netWorkingDays * scaleFactor);
+        th = Math.round(ref.holiday * scaleFactor);
+        tod = volumeData.length - twd; // Off days include weekends and holidays
+        mm = ref.month;
+      } else {
+        // Fallback to standard 5/7 ratio
+        twd = Math.round(volumeData.length * (5/7));
+        tod = volumeData.length - twd;
+      }
+    }
+    return { targetWorkingDays: twd, targetOffDays: tod, targetHolidays: th, matchedMonth: mm };
+  }, [volumeData, workingDaysRef]);
+
+  const isApprovedLeave = (employeeId: string, date: string) => {
+    return leaveRequests.some(req => 
+      req.employeeId === employeeId && 
+      req.date === date && 
+      req.status === 'approved'
+    );
+  };
+
+  const shortageInfo = useMemo(() => {
+    if (employees.length === 0 || volumeData.length === 0) return null;
+    
+    // Calculate total approved leave days in the period
+    const totalApprovedLeaveDays = leaveRequests.reduce((sum, req) => {
+      if (req.status === 'approved' && volumeData.some(d => d.date === req.date)) {
+        return sum + 1;
+      }
+      return sum;
+    }, 0);
+
+    // Calculate base ideal capacity (without extra days)
+    const baseIdealCapacity = (employees.length * targetWorkingDays) - totalApprovedLeaveDays;
+    
+    // Calculate raw demand (100% supply factor)
+    let totalRawDemandBase = 0;
+    volumeData.forEach(day => {
+      let dayTotalHours = 0;
+      let maxAgentsForDay = 0;
+      const allIntervalKeys = Object.keys(day.intervals).sort();
+      Object.entries(day.intervals).forEach(([interval, val]) => {
+        const duration = getIntervalDuration(interval, allIntervalKeys);
+        const volume = Number(val) || 0;
+        let res;
+        if (channelType === 'chat' || channelType === 'whatsapp' || channelType === 'multiskill_chat_wa') {
+          res = calculateRequiredAgentsChat(volume, aht, targetSL, targetTime, concurrency, duration);
+        } else if (channelType === 'email') {
+          res = calculateRequiredAgentsEmail(volume, aht, targetSL, tat, duration);
+        } else {
+          res = calculateRequiredAgents(volume, aht, targetSL, targetTime, duration);
+        }
+        dayTotalHours += res.agents * duration;
+        if (res.agents > maxAgentsForDay) maxAgentsForDay = res.agents;
+      });
+      const weight = Math.max(
+        Math.ceil((dayTotalHours / 8) * (1 + shrinkage)),
+        Math.ceil(maxAgentsForDay * (1 + shrinkage))
+      );
+      totalRawDemandBase += weight;
+    });
+    
+    const baseShortage = totalRawDemandBase - baseIdealCapacity;
+    const suggestedExtraDays = baseShortage > 0 ? Math.ceil(baseShortage / employees.length) : 0;
+    
+    const currentIdealCapacity = employees.reduce((sum, emp) => {
+      const empExtraDays = emp.extraWorkingDays !== undefined ? emp.extraWorkingDays : extraWorkingDays;
+      const empExtraHours = emp.extraHours !== undefined ? emp.extraHours : extraHours;
+      const shiftMultiplier = (8 + empExtraHours) / 8;
+      
+      // Calculate this employee's approved leave days in this period
+      const empLeaveDays = leaveRequests.filter(req => 
+        req.employeeId === emp.id && 
+        req.status === 'approved' && 
+        volumeData.some(d => d.date === req.date)
+      ).length;
+
+      return sum + ((targetWorkingDays + empExtraDays - empLeaveDays) * shiftMultiplier);
+    }, 0);
+
+    let currentRawDemand = 0;
+    volumeData.forEach(day => {
+      const needed = dailyWeights[day.date] || 0;
+      currentRawDemand += needed; // Actual real demand
+    });
+
+    const currentShortage = Math.max(0, currentRawDemand - currentIdealCapacity);
+
+    // Monthly FTE Calculation
+    const totalWorkHours = volumeData.reduce((acc, day) => {
+      let dayHours = 0;
+      const allIntervalKeys = Object.keys(day.intervals).sort();
+      Object.entries(day.intervals).forEach(([interval, val]) => {
+        // Check if interval is within window for this specific day
+        const dayName = day.day; // e.g., "Monday"
+        const dayConfig = operationalWindows?.[dayName];
+        
+        let isInWindow = true;
+        if (dayConfig) {
+          if (!dayConfig.isOpen) {
+            isInWindow = false;
+          } else {
+            isInWindow = isIntervalInWindow(interval, dayConfig.start, dayConfig.end);
+          }
+        }
+
+        if (!isInWindow) return;
+
+        const duration = getIntervalDuration(interval, allIntervalKeys);
+        const volume = Number(val) || 0;
+        let res;
+        if (channelType === 'chat' || channelType === 'whatsapp' || channelType === 'multiskill_chat_wa') {
+          res = calculateRequiredAgentsChat(volume, aht, targetSL, targetTime, concurrency, duration);
+        } else if (channelType === 'email') {
+          res = calculateRequiredAgentsEmail(volume, aht, targetSL, tat, duration);
+        } else {
+          res = calculateRequiredAgents(volume, aht, targetSL, targetTime, duration);
+        }
+        dayHours += res.agents * duration;
+      });
+      return acc + dayHours;
+    }, 0);
+
+    const netFTE = totalWorkHours / (8 * targetWorkingDays);
+    const grossFTE = netFTE / (1 - shrinkage);
+
+    return { 
+      baseShortage, 
+      suggestedExtraDays, 
+      currentShortage,
+      isCovered: currentShortage === 0,
+      grossFTE: Math.ceil(grossFTE),
+      totalWorkHours: Math.round(totalWorkHours),
+      effectiveSupply: currentIdealCapacity
+    };
+  }, [employees.length, volumeData, targetWorkingDays, extraWorkingDays, extraHours, dailyWeights, aht, targetSL, targetTime, shrinkage, operationalWindows, channelType, concurrency, tat]);
 
   useEffect(() => {
     const unsubVolume = onSnapshot(query(collection(db, 'forecastVolume')), (snapshot) => {
       const list = snapshot.docs.map(doc => doc.data() as ForecastVolumeData);
       const sorted = list.sort((a, b) => a.date.localeCompare(b.date));
-      setVolumeData(sorted);
+      setAllVolumeData(sorted);
       if (sorted.length > 0 && !selectedDateForAnalysis) {
         setSelectedDateForAnalysis(sorted[0].date);
       }
@@ -260,18 +718,41 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
     const unsubRoster = onSnapshot(doc(db, 'roster', 'current'), (snapshot) => {
       if (snapshot.exists()) {
         const data = snapshot.data();
-        if (data.roster) setRoster(data.roster);
+        if (data.roster) {
+          // Sanitize to prevent undefined issues
+          const sanitized = data.roster.map((emp: any) => ({
+            ...emp,
+            gender: emp.gender || 'L',
+            preferredShifts: emp.preferredShifts || [],
+            extraHours: emp.extraHours !== undefined ? emp.extraHours : 0
+          }));
+          setRoster(sanitized);
+        }
       }
     });
 
     const unsubSettings = onSnapshot(doc(db, 'erlangSettings', 'current'), (snapshot) => {
       if (snapshot.exists()) {
         const data = snapshot.data();
+        if (data.channelType) setChannelType(data.channelType);
         if (data.aht) setAht(data.aht);
         if (data.targetSL) setTargetSL(data.targetSL / 100); // Erlang lib expects 0.8 for 80%
         if (data.targetTime) setTargetTime(data.targetTime);
+        if (data.concurrency) setConcurrency(data.concurrency);
+        if (data.tat) setTat(data.tat);
         if (data.shrinkage) setShrinkage(data.shrinkage / 100);
+        if (data.operationalWindows) setOperationalWindows(data.operationalWindows);
+        if (data.extraWorkingDays !== undefined) setExtraWorkingDays(data.extraWorkingDays);
+        if (data.extraHours !== undefined) setExtraHours(data.extraHours);
       }
+    });
+
+    const qLeaves = isAdmin 
+      ? query(collection(db, 'leaveRequests'))
+      : query(collection(db, 'leaveRequests'), where('status', '==', 'approved'));
+
+    const unsubLeaves = onSnapshot(qLeaves, (snapshot) => {
+      setLeaveRequests(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as LeaveRequest)));
     });
 
     return () => {
@@ -281,6 +762,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
       unsubRef();
       unsubRoster();
       unsubSettings();
+      unsubLeaves();
     };
   }, []);
 
@@ -350,7 +832,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
     </Card>
   );
 
-  const generateBalancedRoster = async () => {
+  const generateBalancedRoster = async (mode: 'base' | 'overtime' = 'base') => {
     if (volumeData.length === 0 || shiftCodes.length === 0 || employees.length === 0) {
       toast.error('Missing data (Volume, Shifts, or Employees)');
       return;
@@ -358,91 +840,135 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
 
     setLoading(true);
     try {
-      // 1. Use memoized daily requirements
-      // (dailyWeights and totalDemand are available from component scope)
+      // 1. Use memoized daily requirements (already carry-over processed in processedVolume)
 
-      // 2. Determine Target Working Days from Reference (Scaled to forecast duration)
-      let targetWorkingDays = 22; 
-      let targetOffDays = 9;
-      let matchedMonth = "Default (22)";
-      
-      if (volumeData.length > 0) {
-        const firstDate = new Date(volumeData[0].date);
-        const monthStr = format(firstDate, 'MMM-yy');
-        const ref = workingDaysRef.find(r => r.month.toLowerCase() === monthStr.toLowerCase());
-        
-        if (ref) {
-          // Scale monthly reference to the actual forecast length
-          const scaleFactor = volumeData.length / ref.totalDays;
-          targetWorkingDays = Math.round(ref.workingDays * scaleFactor);
-          targetOffDays = volumeData.length - targetWorkingDays;
-          matchedMonth = ref.month;
-        } else {
-          // Fallback: 5/7 ratio
-          targetWorkingDays = Math.round(volumeData.length * (22/31));
-          targetOffDays = volumeData.length - targetWorkingDays;
+      // 2. Determine Effective Target Working Days per Employee
+      const getEmpTargetDays = (emp: Employee) => {
+        const empExtraDays = emp.extraWorkingDays !== undefined ? emp.extraWorkingDays : extraWorkingDays;
+        return mode === 'overtime' ? (targetWorkingDays + empExtraDays) : targetWorkingDays;
+      };
+
+      // 2.5 Constraint Check Helper
+      const isConstraintViolation = (emp: EmployeeRoster, shiftCode: string) => {
+        if (shiftCode === 'OFF') return false;
+        const codeObj = shiftCodes.find(c => c.code === shiftCode);
+        if (!codeObj) return false;
+
+        // Female Night Shift Constraint (P = Perempuan / Female)
+        if (emp.gender === 'P' && codeObj.isNightShift) return true;
+
+        // Shift Preference Constraint
+        if (emp.preferredShifts && emp.preferredShifts.length > 0) {
+          if (!emp.preferredShifts.includes(shiftCode)) return true;
         }
-      }
-      toast.info(`Targets: ${targetWorkingDays}W / ${targetOffDays}O (${matchedMonth})`);
+
+        return false;
+      };
+
+      toast.info(`Generating ${mode === 'overtime' ? 'Overtime' : 'Base'} Roster with per-agent settings...`);
 
       // 3. Calculate Precision Headcounts
       // Total shifts available in the month for all employees (Ideal Capacity)
-      const idealCapacity = employees.length * targetWorkingDays;
+      const totalApprovedLeaveDays = leaveRequests.reduce((sum, req) => {
+        if (req.status === 'approved' && volumeData.some(d => d.date === req.date)) {
+          return sum + 1;
+        }
+        return sum;
+      }, 0);
+
+      const idealCapacity = employees.reduce((sum, emp) => sum + getEmpTargetDays(emp), 0) - totalApprovedLeaveDays;
       const adjustedDailyHeadcounts: Record<string, number> = {};
       
       // Calculate raw demand (100% coverage)
       const rawDailyDemand: Record<string, number> = {};
       let totalRawDemand = 0;
-      volumeData.forEach(day => {
+      processedVolume.forEach(day => {
         const needed = dailyWeights[day.date] || 0;
-        // Apply 90% supply factor as requested by user
-        const supplyTarget = Math.ceil(needed * 0.9);
-        const capped = Math.min(supplyTarget, employees.length);
+        const onLeaveCount = leaveRequests.filter(r => r.date === day.date && r.status === 'approved').length;
+        const availableCount = employees.length - onLeaveCount;
+        
+        // Use 100% supply factor for base planning
+        const supplyTarget = Math.ceil(needed);
+        const capped = Math.min(supplyTarget, availableCount);
         rawDailyDemand[day.date] = capped;
         totalRawDemand += capped;
       });
 
-      // If totalRawDemand > idealCapacity, we allow overtime to meet demand
-      // If totalRawDemand < idealCapacity, we fill up to idealCapacity to ensure staff get their days
+      // Initial assignment based on raw demand
       let assignedSoFar = 0;
-      volumeData.forEach(day => {
+      processedVolume.forEach(day => {
         adjustedDailyHeadcounts[day.date] = rawDailyDemand[day.date];
         assignedSoFar += rawDailyDemand[day.date];
       });
 
       let diff = idealCapacity - assignedSoFar;
-      const sortedByWeight = [...volumeData].sort((a, b) => dailyWeights[b.date] - dailyWeights[a.date]);
       
-      let safetyCounter = 0;
-      // Only fill up if we have a surplus of staff (diff > 0)
-      // If we have a shortage (diff < 0), we leave it as is (Overtime Mode)
-      while (diff > 0 && safetyCounter < 100) {
-        let changed = false;
-        for (const day of sortedByWeight) {
-          if (adjustedDailyHeadcounts[day.date] < employees.length) {
-            adjustedDailyHeadcounts[day.date]++;
-            diff--;
-            changed = true;
+      // Balancing Logic:
+      if (diff > 0) {
+        // Surplus: Fill up to idealCapacity to ensure staff get their days
+        // CRITICAL: Skip days that are officially closed in operational windows
+        const sortedByWeightDesc = [...processedVolume].sort((a, b) => dailyWeights[b.date] - dailyWeights[a.date]);
+        let safetyCounter = 0;
+        while (diff > 0 && safetyCounter < 100) {
+          let changed = false;
+          for (const day of sortedByWeightDesc) {
+            const dayConfig = matchDayName(day.day, operationalWindows, day.date);
+            const isDayOpen = dayConfig ? dayConfig.isOpen : true;
+            const onLeaveCount = leaveRequests.filter(r => r.date === day.date && r.status === 'approved').length;
+            const availableCount = employees.length - onLeaveCount;
+
+            if (isDayOpen && adjustedDailyHeadcounts[day.date] < availableCount) {
+              adjustedDailyHeadcounts[day.date]++;
+              diff--;
+              changed = true;
+            }
+            if (diff === 0) break;
           }
-          if (diff === 0) break;
+          if (!changed) break;
+          safetyCounter++;
         }
-        if (!changed) break;
-        safetyCounter++;
+      } else if (diff < 0) {
+        // Shortage: we MUST reduce assignments to stay within the active target days.
+        const sortedByWeightAsc = [...processedVolume].sort((a, b) => dailyWeights[a.date] - dailyWeights[b.date]);
+        let safetyCounter = 0;
+        while (diff < 0 && safetyCounter < 100) {
+          let changed = false;
+          for (const day of sortedByWeightAsc) {
+            if (adjustedDailyHeadcounts[day.date] > 0) {
+              adjustedDailyHeadcounts[day.date]--;
+              diff++;
+              changed = true;
+            }
+            if (diff === 0) break;
+          }
+          if (!changed) break;
+          safetyCounter++;
+        }
       }
 
       // 4. Calculate Shift Distributions for each day based on adjusted headcount
-      // ENHANCED: Greedy Coverage Optimizer to match interval-level demand
       const dailyRequirements: Record<string, Record<string, number>> = {};
-      volumeData.forEach(day => {
+
+      processedVolume.forEach(day => {
         const headcount = adjustedDailyHeadcounts[day.date];
         const shiftSuggestions: Record<string, number> = {};
         shiftCodes.forEach(c => shiftSuggestions[c.code] = 0);
 
         // Calculate required agents per interval for this day
         const intervalRequirements: Record<string, number> = {};
-        Object.entries(day.intervals).forEach(([interval, val]) => {
-          const volume = Number(val) || 0;
-          const res = calculateRequiredAgents(volume, aht, targetSL, targetTime);
+        const allIntervalKeys = Object.keys(day.intervals).sort();
+        
+        // Intervals are already processed for window and carry-over by processedVolume
+        Object.entries(day.intervals).forEach(([interval, effectiveVolume]) => {
+          const duration = getIntervalDuration(interval, allIntervalKeys);
+          let res;
+          if (channelType === 'chat' || channelType === 'whatsapp' || channelType === 'multiskill_chat_wa') {
+            res = calculateRequiredAgentsChat(effectiveVolume as number, aht, targetSL, targetTime, concurrency, duration);
+          } else if (channelType === 'email') {
+            res = calculateRequiredAgentsEmail(effectiveVolume as number, aht, targetSL, tat, duration);
+          } else {
+            res = calculateRequiredAgents(effectiveVolume as number, aht, targetSL, targetTime, duration);
+          }
           intervalRequirements[interval] = Math.ceil(res.agents * (1 + shrinkage));
         });
 
@@ -455,18 +981,39 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
           let maxScore = -Infinity;
 
           for (const code of shiftCodes) {
-            // Score = how much this shift reduces under-coverage
             let score = 0;
+            
             Object.keys(intervalRequirements).forEach(interval => {
-              if (isIntervalInShift(interval, code.startTime, code.endTime)) {
+              if (isIntervalInShift(interval, code.startTime, code.endTime, extraHours)) {
                 const gap = intervalRequirements[interval] - currentAssigned[interval];
-                if (gap > 0) {
-                  score += gap * 3; // Even higher weight for filling gaps
+                
+                // Check if this interval is actually within the operational window for this day
+                const dayName = day.day;
+                const dayConfig = matchDayName(dayName, operationalWindows, day.date);
+                
+                let isOpWindow = true;
+                if (dayConfig) {
+                  if (!dayConfig.isOpen) isOpWindow = false;
+                  else isOpWindow = isIntervalInWindow(interval, dayConfig.start, dayConfig.end);
+                }
+
+                if (!isOpWindow) {
+                  // HEAVY PENALTY: Do not assign staff during closed hours
+                  score -= 10000;
+                } else if (gap > 0) {
+                  // CRITICAL: Filling an empty slot is highest priority
+                  score += Math.min(gap, 1) * 2000 + Math.max(0, gap - 1) * 500;
                 } else {
-                  score -= (Math.abs(gap) + 1) * 6; // Even heavier penalty for over-coverage
+                  // MINOR PENALTY: Over-coverage is much better than under-coverage
+                  score -= (Math.abs(gap) + 1) * 10;
                 }
               }
             });
+
+            // Tie-breaker: prefer shifts that are already suggested for this day
+            if (shiftSuggestions[code.code] > 0) {
+              score += 1;
+            }
 
             if (score > maxScore) {
               maxScore = score;
@@ -477,7 +1024,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
           if (bestShift) {
             shiftSuggestions[bestShift.code]++;
             Object.keys(intervalRequirements).forEach(interval => {
-              if (isIntervalInShift(interval, bestShift!.startTime, bestShift!.endTime)) {
+              if (isIntervalInShift(interval, bestShift!.startTime, bestShift!.endTime, extraHours)) {
                 currentAssigned[interval]++;
               }
             });
@@ -490,16 +1037,31 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
       });
 
       // 5. Initialize Roster and Shift Counters
-      const newRoster: EmployeeRoster[] = employees.map(emp => ({
-        employeeId: emp.id,
-        employeeName: emp.name,
-        nip: emp.nip,
-        days: {},
-        totalWorkingDays: 0,
-        totalOffDays: 0,
-        targetWorkingDays: targetWorkingDays,
-        targetOffDays: targetOffDays
-      }));
+      const newRoster: EmployeeRoster[] = employees.map(emp => {
+        const baseEmpTargetDays = getEmpTargetDays(emp);
+        const empLeaveDays = leaveRequests.filter(req => 
+          req.employeeId === emp.id && 
+          req.status === 'approved' && 
+          volumeData.some(d => d.date === req.date)
+        ).length;
+        
+        const empTargetDays = Math.max(0, baseEmpTargetDays - empLeaveDays);
+        const empTargetOff = Math.max(0, processedVolume.length - empTargetDays - empLeaveDays);
+
+        return {
+          employeeId: emp.id,
+          employeeName: emp.name,
+          nip: emp.nip,
+          gender: emp.gender || 'L',
+          preferredShifts: emp.preferredShifts || [],
+          days: {},
+          totalWorkingDays: 0,
+          totalOffDays: 0,
+          targetWorkingDays: empTargetDays,
+          targetOffDays: empTargetOff,
+          extraHours: emp.extraHours !== undefined ? emp.extraHours : extraHours
+        };
+      });
 
       const shiftCounts: Record<string, Record<string, number>> = {}; // employeeId -> shiftCode -> count
       employees.forEach(emp => {
@@ -510,15 +1072,23 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
       });
 
       // 6. Assign shifts day by day with enhanced "Best Match" logic for Jumping Accuracy and Coverage
-      volumeData.forEach((day, dayIdx) => {
+      processedVolume.forEach((day, dayIdx) => {
         const reqs = { ...dailyRequirements[day.date] };
-        const prevDayDate = dayIdx > 0 ? volumeData[dayIdx - 1].date : null;
-        const remainingDaysInMonth = volumeData.length - dayIdx;
+        const prevDayDate = dayIdx > 0 ? processedVolume[dayIdx - 1].date : null;
+        const remainingDaysInMonth = processedVolume.length - dayIdx;
         
         // Create a list of all required shift slots for today
         const shiftSlots: string[] = [];
         Object.entries(reqs).forEach(([code, count]) => {
           for (let i = 0; i < count; i++) shiftSlots.push(code);
+        });
+
+        // Pre-assign approved leave as OFF
+        newRoster.forEach(emp => {
+          if (!emp.days[day.date] && isApprovedLeave(emp.employeeId, day.date)) {
+            emp.days[day.date] = 'OFF';
+            emp.totalOffDays++;
+          }
         });
 
         const availableEmployees = [...newRoster].filter(emp => !emp.days[day.date]);
@@ -527,7 +1097,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
         const getConsecutive = (emp: EmployeeRoster) => {
           let count = 0;
           for (let i = dayIdx - 1; i >= 0; i--) {
-            const d = volumeData[i].date;
+            const d = processedVolume[i].date;
             if (emp.days[d] && emp.days[d] !== 'OFF') count++;
             else break;
           }
@@ -538,7 +1108,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
         const getConsecutiveOff = (emp: EmployeeRoster) => {
           let count = 0;
           for (let i = dayIdx - 1; i >= 0; i--) {
-            const d = volumeData[i].date;
+            const d = processedVolume[i].date;
             if (emp.days[d] === 'OFF') count++;
             else break;
           }
@@ -565,6 +1135,13 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
               // 1. Hard Constraints (Rest Period & Labor Law)
               if (consec >= 5) score -= 1000; // Penalty for 5 days
               if (consec >= 6) score -= 8000; // Critical penalty for 6-day violation
+
+              // 1.2 Gender-based constraints & Preferences
+              if (isConstraintViolation(emp, shiftCode)) {
+                continue; // HARD SKIP: Do not assign this shift to this employee
+              } else if (emp.preferredShifts && emp.preferredShifts.includes(shiftCode)) {
+                score += 2000; // Significant bonus for fulfilling a preference
+              }
               
               // 1.5 OFF Day Distribution (Spacing)
               if (consecOff === 0 && emp.totalOffDays < emp.targetOffDays) {
@@ -579,7 +1156,8 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                 if (prevShiftCode && prevShiftCode !== 'OFF') {
                   const prevCodeObj = shiftCodes.find(c => c.code === prevShiftCode);
                   if (prevCodeObj) {
-                    const rest = getRestHours(prevCodeObj, codeObj);
+                    const empExtraHours = emp.extraHours !== undefined ? emp.extraHours : extraHours;
+                    const rest = getRestHours(prevCodeObj, codeObj, empExtraHours);
                     if (rest < 11 * 60) score -= 10000; // Critical penalty for rest violation
                     
                     // 2. Forward Rotation (Jumping Accuracy)
@@ -601,7 +1179,12 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
 
               // 3. Monthly Target Adherence
               if (isCritical) score += 5000;
-              score += needed * 50;
+              score += needed * 100;
+
+              // STRICT TARGET ADHERENCE: Heavy penalty if already at or over target
+              if (emp.totalWorkingDays >= emp.targetWorkingDays) {
+                score -= 20000;
+              }
 
               // 4. Shift Balancing
               const shiftCount = shiftCounts[emp.employeeId][shiftCode] || 0;
@@ -669,7 +1252,8 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                     const prev = emp.days[prevDayDate];
                     if (prev && prev !== 'OFF') {
                       const sPrev = shiftCodes.find(sc => sc.code === prev);
-                      if (sPrev && getRestHours(sPrev, sCode) < 11 * 60) return false;
+                      const empExtraHours = emp.extraHours !== undefined ? emp.extraHours : extraHours;
+                      if (sPrev && getRestHours(sPrev, sCode, empExtraHours) < 11 * 60) return false;
                     }
                     return true;
                   };
@@ -731,7 +1315,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                       const prev = emp.days[prevDayDate];
                       if (prev && prev !== 'OFF') {
                         const sPrev = shiftCodes.find(sc => sc.code === prev);
-                        if (sPrev && getRestHours(sPrev, sCode) < 11 * 60) return false;
+                        if (sPrev && getRestHours(sPrev, sCode, extraHours) < 11 * 60) return false;
                       }
                       return true;
                     };
@@ -755,6 +1339,154 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
           }
         }
       });
+
+      // 6.8 Compliance First Rebalancer: Resolve violations before worrying about precision
+      // This stage specifically targets Rest and Consecutive Day violations
+      let complianceSafety = 0;
+      while (complianceSafety < 500) {
+        let violationFound = false;
+        for (const emp of newRoster) {
+          for (let i = 0; i < volumeData.length; i++) {
+            const date = volumeData[i].date;
+            const shift = emp.days[date];
+            if (shift === 'OFF') continue;
+
+            // 1. Check Rest Violation
+            let restViolation = false;
+            if (i > 0) {
+              const prevShift = emp.days[volumeData[i-1].date];
+              if (prevShift && prevShift !== 'OFF') {
+                const sPrev = shiftCodes.find(sc => sc.code === prevShift);
+                const sCurr = shiftCodes.find(sc => sc.code === shift);
+                if (sPrev && sCurr && getRestHours(sPrev, sCurr, extraHours) < 11 * 60) {
+                  restViolation = true;
+                }
+              }
+            }
+
+            // 2. Check Consecutive Violation
+            let consecCount = 0;
+            for (let j = i; j >= 0; j--) {
+              if (emp.days[volumeData[j].date] !== 'OFF') consecCount++;
+              else break;
+            }
+            for (let j = i + 1; j < volumeData.length; j++) {
+              if (emp.days[volumeData[j].date] !== 'OFF') consecCount++;
+              else break;
+            }
+            const consecViolation = consecCount > 5;
+
+            if (restViolation || consecViolation) {
+              let resolved = false;
+              // Try to find an OFF day for this employee that doesn't cause violations
+              for (let j = 0; j < volumeData.length; j++) {
+                const targetDate = volumeData[j].date;
+                if (emp.days[targetDate] === 'OFF' && !isApprovedLeave(emp.employeeId, targetDate)) {
+                  const sCurr = shiftCodes.find(sc => sc.code === shift)!;
+                  let targetRestOk = true;
+                  if (j > 0) {
+                    const prev = emp.days[volumeData[j-1].date];
+                    if (prev && prev !== 'OFF') {
+                      const sPrev = shiftCodes.find(sc => sc.code === prev);
+                      if (sPrev && getRestHours(sPrev, sCurr, extraHours) < 11 * 60) targetRestOk = false;
+                    }
+                  }
+                  if (targetRestOk && j < volumeData.length - 1) {
+                    const next = emp.days[volumeData[j+1].date];
+                    if (next && next !== 'OFF') {
+                      const sNext = shiftCodes.find(sc => sc.code === next);
+                      if (sNext && getRestHours(sCurr, sNext, extraHours) < 11 * 60) targetRestOk = false;
+                    }
+                  }
+
+                  let targetConsecCount = 1;
+                  for (let k = j - 1; k >= 0; k--) {
+                    if (emp.days[volumeData[k].date] !== 'OFF') targetConsecCount++;
+                    else break;
+                  }
+                  for (let k = j + 1; k < volumeData.length; k++) {
+                    if (emp.days[volumeData[k].date] !== 'OFF') targetConsecCount++;
+                    else break;
+                  }
+                  const targetConsecOk = targetConsecCount <= 5;
+
+                  if (targetRestOk && targetConsecOk && !isConstraintViolation(emp, shift)) {
+                    emp.days[targetDate] = shift;
+                    emp.days[date] = 'OFF';
+                    resolved = true;
+                    violationFound = true;
+                    break;
+                  }
+                }
+              }
+
+              if (!resolved) {
+                // Try swapping with another employee
+                for (const other of newRoster) {
+                  if (other.employeeId === emp.employeeId) continue;
+                  if (other.days[date] !== 'OFF' || isApprovedLeave(other.employeeId, date)) continue;
+
+                  for (let j = 0; j < volumeData.length; j++) {
+                    const otherDate = volumeData[j].date;
+                    const otherShift = other.days[otherDate];
+                    if (otherShift !== 'OFF' && emp.days[otherDate] === 'OFF' && !isApprovedLeave(emp.employeeId, otherDate)) {
+                      const sOther = shiftCodes.find(sc => sc.code === otherShift)!;
+                      let empOtherRestOk = true;
+                      if (j > 0) {
+                        const prev = emp.days[volumeData[j-1].date];
+                        if (prev && prev !== 'OFF') {
+                          const sPrev = shiftCodes.find(sc => sc.code === prev);
+                          if (sPrev && getRestHours(sPrev, sOther, extraHours) < 11 * 60) empOtherRestOk = false;
+                        }
+                      }
+                      if (empOtherRestOk && j < volumeData.length - 1) {
+                        const next = emp.days[volumeData[j+1].date];
+                        if (next && next !== 'OFF') {
+                          const sNext = shiftCodes.find(sc => sc.code === next);
+                          if (sNext && getRestHours(sOther, sNext, extraHours) < 11 * 60) empOtherRestOk = false;
+                        }
+                      }
+
+                      const sEmp = shiftCodes.find(sc => sc.code === shift)!;
+                      const dateIdx = i;
+                      let otherDateRestOk = true;
+                      if (dateIdx > 0) {
+                        const prev = other.days[volumeData[dateIdx-1].date];
+                        if (prev && prev !== 'OFF') {
+                          const sPrev = shiftCodes.find(sc => sc.code === prev);
+                          if (sPrev && getRestHours(sPrev, sEmp, extraHours) < 11 * 60) otherDateRestOk = false;
+                        }
+                      }
+                      if (otherDateRestOk && dateIdx < volumeData.length - 1) {
+                        const next = other.days[volumeData[dateIdx+1].date];
+                        if (next && next !== 'OFF') {
+                          const sNext = shiftCodes.find(sc => sc.code === next);
+                          if (sNext && getRestHours(sEmp, sNext, extraHours) < 11 * 60) otherDateRestOk = false;
+                        }
+                      }
+
+                      if (empOtherRestOk && otherDateRestOk && !isConstraintViolation(emp, otherShift) && !isConstraintViolation(other, shift)) {
+                        emp.days[date] = 'OFF';
+                        emp.days[otherDate] = otherShift;
+                        other.days[date] = shift;
+                        other.days[otherDate] = 'OFF';
+                        resolved = true;
+                        violationFound = true;
+                        break;
+                      }
+                    }
+                  }
+                  if (resolved) break;
+                }
+              }
+            }
+            if (violationFound) break;
+          }
+          if (violationFound) break;
+        }
+        if (!violationFound) break;
+        complianceSafety++;
+      }
 
       // 7. Post-Processing Rebalancer for 100% Precision
       // If someone is over and someone is under, swap shifts on days where the under-target person is OFF
@@ -804,7 +1536,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
         for (const day of daysToTry) {
           const overShift = overTarget.days[day.date];
           const underShift = underTarget.days[day.date];
-          if (overShift !== 'OFF' && underShift === 'OFF') {
+          if (overShift !== 'OFF' && underShift === 'OFF' && !isApprovedLeave(underTarget.employeeId, day.date)) {
             const dayIdx = volumeData.findIndex(d => d.date === day.date);
             const sCurr = shiftCodes.find(sc => sc.code === overShift);
             if (!sCurr) continue;
@@ -817,7 +1549,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
               if (prevShift && prevShift !== 'OFF') {
                 const sPrev = shiftCodes.find(sc => sc.code === prevShift);
                 if (sPrev) {
-                  if (getRestHours(sPrev, sCurr) < 11 * 60) restOk = false;
+                  if (getRestHours(sPrev, sCurr, extraHours) < 11 * 60) restOk = false;
                   const [pH] = sPrev.startTime.split(':').map(Number);
                   const [cH] = sCurr.startTime.split(':').map(Number);
                   if (cH < pH) isJump = true;
@@ -830,7 +1562,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
               if (nextShift && nextShift !== 'OFF') {
                 const sNext = shiftCodes.find(sc => sc.code === nextShift);
                 if (sNext) {
-                  if (getRestHours(sCurr, sNext) < 11 * 60) restOk = false;
+                  if (getRestHours(sCurr, sNext, extraHours) < 11 * 60) restOk = false;
                   const [cH] = sCurr.startTime.split(':').map(Number);
                   const [nH] = sNext.startTime.split(':').map(Number);
                   if (nH < cH) isJump = true;
@@ -850,7 +1582,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
             }
             if (count >= 5) consecOk = false;
 
-            if (restOk && consecOk && !isJump) {
+            if (restOk && consecOk && !isJump && !isConstraintViolation(underTarget, overShift)) {
               underTarget.days[day.date] = overShift;
               overTarget.days[day.date] = 'OFF';
               overTarget.totalWorkingDays--; overTarget.totalOffDays++;
@@ -860,12 +1592,12 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
           }
         }
 
-        // STAGE 1.5: Try to find a swap that satisfies rest and consecutive rules (even if it's a jump)
+        // STAGE 2: Try to find a swap that satisfies rest rules (Consecutive is secondary)
         if (!swapped) {
           for (const day of daysToTry) {
             const overShift = overTarget.days[day.date];
             const underShift = underTarget.days[day.date];
-            if (overShift !== 'OFF' && underShift === 'OFF') {
+            if (overShift !== 'OFF' && underShift === 'OFF' && !isApprovedLeave(underTarget.employeeId, day.date)) {
               const dayIdx = volumeData.findIndex(d => d.date === day.date);
               const sCurr = shiftCodes.find(sc => sc.code === overShift);
               if (!sCurr) continue;
@@ -876,7 +1608,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                 const prevShift = underTarget.days[prevDate];
                 if (prevShift && prevShift !== 'OFF') {
                   const sPrev = shiftCodes.find(sc => sc.code === prevShift);
-                  if (sPrev && getRestHours(sPrev, sCurr) < 11 * 60) restOk = false;
+                  if (sPrev && getRestHours(sPrev, sCurr, extraHours) < 11 * 60) restOk = false;
                 }
               }
               if (restOk && dayIdx < volumeData.length - 1) {
@@ -884,23 +1616,11 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                 const nextShift = underTarget.days[nextDate];
                 if (nextShift && nextShift !== 'OFF') {
                   const sNext = shiftCodes.find(sc => sc.code === nextShift);
-                  if (sNext && getRestHours(sCurr, sNext) < 11 * 60) restOk = false;
+                  if (sNext && getRestHours(sCurr, sNext, extraHours) < 11 * 60) restOk = false;
                 }
               }
 
-              let consecOk = true;
-              let count = 0;
-              for (let i = dayIdx - 1; i >= 0; i--) {
-                if (underTarget.days[volumeData[i].date] !== 'OFF') count++;
-                else break;
-              }
-              for (let i = dayIdx + 1; i < volumeData.length; i++) {
-                if (underTarget.days[volumeData[i].date] !== 'OFF') count++;
-                else break;
-              }
-              if (count >= 5) consecOk = false;
-
-              if (restOk && consecOk) {
+              if (restOk && !isConstraintViolation(underTarget, overShift)) {
                 underTarget.days[day.date] = overShift;
                 overTarget.days[day.date] = 'OFF';
                 overTarget.totalWorkingDays--; overTarget.totalOffDays++;
@@ -909,55 +1629,6 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
               }
             }
           }
-        }
-
-        // STAGE 2: Try to find a swap that satisfies Consecutive rule (Primary Rule)
-        if (!swapped) {
-          for (const day of daysToTry) {
-            const overShift = overTarget.days[day.date];
-            const underShift = underTarget.days[day.date];
-            if (overShift !== 'OFF' && underShift === 'OFF') {
-              const dayIdx = volumeData.findIndex(d => d.date === day.date);
-              let count = 0;
-              for (let i = dayIdx - 1; i >= 0; i--) {
-                if (underTarget.days[volumeData[i].date] !== 'OFF') count++;
-                else break;
-              }
-              for (let i = dayIdx + 1; i < volumeData.length; i++) {
-                if (underTarget.days[volumeData[i].date] !== 'OFF') count++;
-                else break;
-              }
-              if (count < 5) {
-                underTarget.days[day.date] = overShift;
-                overTarget.days[day.date] = 'OFF';
-                overTarget.totalWorkingDays--; overTarget.totalOffDays++;
-                underTarget.totalWorkingDays++; underTarget.totalOffDays--;
-                swapped = true; break;
-              }
-            }
-          }
-        }
-
-        // STAGE 3: Forced swap to maintain precision (Secondary Priority)
-        // We only do this if we absolutely must hit the target and no safe swaps exist
-        if (!swapped) {
-          for (const day of daysToTry) {
-            const overShift = overTarget.days[day.date];
-            const underShift = underTarget.days[day.date];
-            if (overShift !== 'OFF' && underShift === 'OFF') {
-              underTarget.days[day.date] = overShift;
-              overTarget.days[day.date] = 'OFF';
-              overTarget.totalWorkingDays--; overTarget.totalOffDays++;
-              underTarget.totalWorkingDays++; underTarget.totalOffDays--;
-              swapped = true; break;
-            }
-          }
-        }
-
-        // STAGE 4: Deep Search Swap (Try to find a 3-way swap if direct swap fails)
-        if (!swapped) {
-          // This is more complex, but for now we'll stick to 2-way swaps to avoid infinite loops
-          // The current logic is already quite aggressive with Stage 3
         }
 
         if (!swapped) break; 
@@ -976,10 +1647,14 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
         let fixed = false;
 
         // STAGE A: Try to find a day where we can just ADD a shift (if headcount < employees.length)
-        for (const day of volumeData) {
-          if (empUnder.days[day.date] === 'OFF' && adjustedDailyHeadcounts[day.date] < employees.length) {
+        // CRITICAL: Must be an OPEN day
+        for (const day of processedVolume) {
+          const dayConfig = matchDayName(day.day, operationalWindows, day.date);
+          const isDayOpen = dayConfig ? dayConfig.isOpen : true;
+
+          if (isDayOpen && empUnder.days[day.date] === 'OFF' && !isApprovedLeave(empUnder.employeeId, day.date) && adjustedDailyHeadcounts[day.date] < employees.length) {
             // Check constraints
-            const dayIdx = volumeData.findIndex(d => d.date === day.date);
+            const dayIdx = processedVolume.findIndex(d => d.date === day.date);
             
             // Find best shift for this day based on demand gap
             const dayReqs = dailyRequirements[day.date];
@@ -1003,27 +1678,40 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
             const sCurr = shiftCodes.find(sc => sc.code === bestShift)!;
             let restOk = true;
             if (dayIdx > 0) {
-              const prev = empUnder.days[volumeData[dayIdx-1].date];
+              const prev = empUnder.days[processedVolume[dayIdx-1].date];
               if (prev && prev !== 'OFF') {
                 const sPrev = shiftCodes.find(sc => sc.code === prev);
-                if (sPrev && getRestHours(sPrev, sCurr) < 11 * 60) restOk = false;
+                if (sPrev && getRestHours(sPrev, sCurr, extraHours) < 11 * 60) restOk = false;
               }
             }
-            if (restOk && dayIdx < volumeData.length - 1) {
-              const next = empUnder.days[volumeData[dayIdx+1].date];
+            if (restOk && dayIdx < processedVolume.length - 1) {
+              const next = empUnder.days[processedVolume[dayIdx+1].date];
               if (next && next !== 'OFF') {
                 const sNext = shiftCodes.find(sc => sc.code === next);
-                if (sNext && getRestHours(sCurr, sNext) < 11 * 60) restOk = false;
+                if (sNext && getRestHours(sCurr, sNext, extraHours) < 11 * 60) restOk = false;
               }
             }
 
             if (restOk) {
-              empUnder.days[day.date] = bestShift;
-              empUnder.totalWorkingDays++;
-              empUnder.totalOffDays--;
-              adjustedDailyHeadcounts[day.date]++;
-              fixed = true;
-              break;
+              // Also check consecutive ok
+              let consecCount = 1;
+              for (let i = dayIdx - 1; i >= 0; i--) {
+                if (empUnder.days[processedVolume[i].date] !== 'OFF') consecCount++;
+                else break;
+              }
+              for (let i = dayIdx + 1; i < processedVolume.length; i++) {
+                if (empUnder.days[processedVolume[i].date] !== 'OFF') consecCount++;
+                else break;
+              }
+              
+              if (consecCount <= 5 && !isConstraintViolation(empUnder, bestShift)) {
+                empUnder.days[day.date] = bestShift;
+                empUnder.totalWorkingDays++;
+                empUnder.totalOffDays--;
+                adjustedDailyHeadcounts[day.date]++;
+                fixed = true;
+                break;
+              }
             }
           }
         }
@@ -1039,29 +1727,33 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
           .sort((a, b) => b.totalWorkingDays - a.totalWorkingDays)[0];
 
         if (empOver) {
-          for (const day of volumeData) {
+          for (const day of processedVolume) {
             const shift = empOver.days[day.date];
-            if (shift !== 'OFF' && empUnder.days[day.date] === 'OFF') {
-              const dayIdx = volumeData.findIndex(d => d.date === day.date);
+            if (shift && shift !== 'OFF' && empUnder.days[day.date] === 'OFF' && !isApprovedLeave(empUnder.employeeId, day.date)) {
+              // Day is already open if someone is working there, but check for safety
+              const dayConfig = matchDayName(day.day, operationalWindows, day.date);
+              if (dayConfig && !dayConfig.isOpen) continue;
+
+              const dayIdx = processedVolume.findIndex(d => d.date === day.date);
               const sCurr = shiftCodes.find(sc => sc.code === shift)!;
               
               let restOk = true;
               if (dayIdx > 0) {
-                const prev = empUnder.days[volumeData[dayIdx-1].date];
+                const prev = empUnder.days[processedVolume[dayIdx-1].date];
                 if (prev && prev !== 'OFF') {
                   const sPrev = shiftCodes.find(sc => sc.code === prev);
-                  if (sPrev && getRestHours(sPrev, sCurr) < 11 * 60) restOk = false;
+                  if (sPrev && getRestHours(sPrev, sCurr, extraHours) < 11 * 60) restOk = false;
                 }
               }
-              if (restOk && dayIdx < volumeData.length - 1) {
-                const next = empUnder.days[volumeData[dayIdx+1].date];
+              if (restOk && dayIdx < processedVolume.length - 1) {
+                const next = empUnder.days[processedVolume[dayIdx+1].date];
                 if (next && next !== 'OFF') {
                   const sNext = shiftCodes.find(sc => sc.code === next);
-                  if (sNext && getRestHours(sCurr, sNext) < 11 * 60) restOk = false;
+                  if (sNext && getRestHours(sCurr, sNext, extraHours) < 11 * 60) restOk = false;
                 }
               }
 
-              if (restOk) {
+              if (restOk && !isConstraintViolation(empUnder, shift) && !isConstraintViolation(empOver, 'OFF')) {
                 empUnder.days[day.date] = shift;
                 empOver.days[day.date] = 'OFF';
                 empUnder.totalWorkingDays++; empUnder.totalOffDays--;
@@ -1084,8 +1776,8 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
         while (safety < 10) {
           let longStreakStart = -1;
           let currentStreak = 0;
-          for (let i = 0; i < volumeData.length; i++) {
-            if (emp.days[volumeData[i].date] !== 'OFF') {
+          for (let i = 0; i < processedVolume.length; i++) {
+            if (emp.days[processedVolume[i].date] !== 'OFF') {
               currentStreak++;
               if (currentStreak > 5 && longStreakStart === -1) longStreakStart = i - currentStreak + 1;
             } else {
@@ -1097,20 +1789,27 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
 
           // Try to move an OFF day from a "short streak" or "isolated OFF" area to the middle of this long streak
           const targetDayIdx = longStreakStart + 3; // Middle of the streak
-          const targetDate = volumeData[targetDayIdx].date;
+          if (targetDayIdx >= processedVolume.length) break;
+          const targetDate = processedVolume[targetDayIdx].date;
           const currentShift = emp.days[targetDate];
 
           // Find another day where this employee is OFF but could work
           let moved = false;
-          for (let i = 0; i < volumeData.length; i++) {
-            const offDate = volumeData[i].date;
+          for (let i = 0; i < processedVolume.length; i++) {
+            const offDate = processedVolume[i].date;
             if (emp.days[offDate] === 'OFF' && Math.abs(i - targetDayIdx) > 2) {
-              // Try to find another employee to swap with
+              // Can we work on offDate? (Check window)
+              const dayConfig = matchDayName(processedVolume[i].day, operationalWindows, processedVolume[i].date);
+              if (dayConfig && !dayConfig.isOpen) continue;
+
+              // Find another employee to swap with
               for (const other of newRoster) {
                 if (other.employeeId !== emp.employeeId && 
                     other.days[targetDate] === 'OFF' && 
-                    other.days[offDate] === currentShift) {
-                  // Potential 2-way swap:
+                    !isApprovedLeave(other.employeeId, targetDate) &&
+                    other.days[offDate] === currentShift &&
+                    !isApprovedLeave(emp.employeeId, offDate)) {
+                  // Potential 2-way swap
                   // Emp: Work(target) -> OFF(target), OFF(off) -> Work(off)
                   // Other: OFF(target) -> Work(target), Work(off) -> OFF(off)
                   // This maintains precision for both!
@@ -1137,8 +1836,8 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
         let consecutive = 0;
         let streakStartIdx = -1;
         
-        for (let i = 0; i < volumeData.length; i++) {
-          if (emp.days[volumeData[i].date] !== 'OFF') {
+        for (let i = 0; i < processedVolume.length; i++) {
+          if (emp.days[processedVolume[i].date] !== 'OFF') {
             if (consecutive === 0) streakStartIdx = i;
             consecutive++;
             
@@ -1149,25 +1848,32 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
               const searchRange = 5;
               for (let offset = -searchRange; offset <= searchRange; offset++) {
                 const targetIdx = i + offset;
-                if (targetIdx >= 0 && targetIdx < volumeData.length && emp.days[volumeData[targetIdx].date] === 'OFF') {
+                if (targetIdx >= 0 && targetIdx < processedVolume.length && 
+                    emp.days[processedVolume[targetIdx].date] === 'OFF' &&
+                    !isApprovedLeave(emp.employeeId, processedVolume[targetIdx].date)) {
+                  // Check if this interval is actually within the operational window for this day
+                  const targetDay = processedVolume[targetIdx];
+                  const dayConfig = matchDayName(targetDay.day, operationalWindows, targetDay.date);
+                  if (dayConfig && !dayConfig.isOpen) continue;
+
                   // Check if moving the shift from 'i' to 'targetIdx' is safe
-                  const shiftToMove = emp.days[volumeData[i].date];
+                  const shiftToMove = emp.days[processedVolume[i].date];
                   
                   // Simple check: would targetIdx create a new streak?
                   let newStreakCount = 1;
                   for (let j = targetIdx - 1; j >= 0; j--) {
-                    if (emp.days[volumeData[j].date] !== 'OFF') newStreakCount++;
+                    if (emp.days[processedVolume[j].date] !== 'OFF') newStreakCount++;
                     else break;
                   }
-                  for (let j = targetIdx + 1; j < volumeData.length; j++) {
-                    if (emp.days[volumeData[j].date] !== 'OFF') newStreakCount++;
+                  for (let j = targetIdx + 1; j < processedVolume.length; j++) {
+                    if (emp.days[processedVolume[j].date] !== 'OFF') newStreakCount++;
                     else break;
                   }
                   
                   if (newStreakCount <= 5) {
                     // Perform the move
-                    emp.days[volumeData[targetIdx].date] = shiftToMove;
-                    emp.days[volumeData[i].date] = 'OFF';
+                    emp.days[processedVolume[targetIdx].date] = shiftToMove;
+                    emp.days[processedVolume[i].date] = 'OFF';
                     moved = true;
                     // Reset streak detection for this employee
                     consecutive = 0;
@@ -1194,7 +1900,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
       let complianceViolations = 0;
       newRoster.forEach(emp => {
         let consecutive = 0;
-        volumeData.forEach(day => {
+        processedVolume.forEach(day => {
           if (emp.days[day.date] !== 'OFF') {
             consecutive++;
             if (consecutive >= 6) complianceViolations++;
@@ -1218,14 +1924,21 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
     }
   };
 
-  function isIntervalInShift(interval: string, shiftStart: string, shiftEnd: string): boolean {
+  function isIntervalInShift(interval: string, shiftStart: string, shiftEnd: string, extra: number = 0): boolean {
     try {
       const [intStartStr] = interval.split(' - ');
       const [intH] = intStartStr.split(':').map(Number);
       const [startH] = shiftStart.split(':').map(Number);
       const [endH] = shiftEnd.split(':').map(Number);
-      if (startH < endH) return intH >= startH && intH < endH;
-      return intH >= startH || intH < endH;
+      
+      let duration = (endH - startH + 24) % 24;
+      // If endH is same as startH but it's not a 0-length shift (which shouldn't happen in our app)
+      if (duration === 0 && shiftStart !== shiftEnd) duration = 24;
+      
+      const effectiveDuration = duration + extra;
+      const diff = (intH - startH + 24) % 24;
+      
+      return diff < effectiveDuration;
     } catch (e) {
       return false;
     }
@@ -1245,7 +1958,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
         emp.nip,
         emp.employeeName,
         employeeInfo?.skill || '-',
-        ...dates.map(d => emp.days[d] || 'OFF'),
+        ...dates.map(d => isApprovedLeave(emp.employeeId, d) ? 'Leave' : (emp.days[d] || 'OFF')),
         emp.totalWorkingDays,
         emp.totalOffDays
       ];
@@ -1340,23 +2053,24 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
             
             const dateStr = format(date, 'yyyy-MM-dd');
             const shift = employee.days[dateStr] || 'OFF';
+            const onLeave = isApprovedLeave(employee.employeeId, dateStr);
             const isToday = isSameDay(date, new Date());
             
             // Check violations
             let restViolation = false;
             let consecViolation = false;
-            const dayIdx = volumeData.findIndex(d => d.date === dateStr);
+            const dayIdx = processedVolume.findIndex(d => d.date === dateStr);
             if (shift !== 'OFF' && dayIdx !== -1) {
-              const prevDayDate = dayIdx > 0 ? volumeData[dayIdx - 1].date : null;
+              const prevDayDate = dayIdx > 0 ? processedVolume[dayIdx - 1].date : null;
               const prevShiftCode = prevDayDate ? employee.days[prevDayDate] : null;
               if (prevShiftCode && prevShiftCode !== 'OFF') {
                 const sPrev = shiftCodes.find(sc => sc.code === prevShiftCode);
                 const sCurr = shiftCodes.find(sc => sc.code === shift);
-                if (sPrev && sCurr && getRestHours(sPrev, sCurr) < 11 * 60) restViolation = true;
+                if (sPrev && sCurr && getRestHours(sPrev, sCurr, extraHours) < 11 * 60) restViolation = true;
               }
               let count = 1;
               for (let i = dayIdx - 1; i >= 0; i--) {
-                if (employee.days[volumeData[i].date] !== 'OFF') count++;
+                if (employee.days[processedVolume[i].date] !== 'OFF') count++;
                 else break;
               }
               if (count >= 6) consecViolation = true;
@@ -1372,15 +2086,20 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                 </span>
                 <div className="mt-2">
                   {shift !== 'OFF' ? (
-                    <div className={`rounded-md p-1.5 text-[10px] font-bold text-center shadow-sm ${getShiftBadgeClasses(shift, restViolation, consecViolation)}`}>
-                      {shift}
+                    <div className={`rounded-md p-1.5 text-[10px] font-bold text-center shadow-sm relative ${getShiftBadgeClasses(shift, restViolation, consecViolation, onLeave)}`}>
+                      {onLeave ? 'Leave' : shift}
+                      {shift !== 'OFF' && (employee.extraHours || 0) > 0 && (
+                        <div className="absolute -top-1 -right-1 bg-indigo-600 text-white text-[7px] px-1 rounded-full font-black border border-white shadow-sm z-10">
+                          +{(employee.extraHours || 0)}h
+                        </div>
+                      )}
                       {(restViolation || consecViolation) && (
                         <AlertCircle className="w-3 h-3 inline ml-1 text-current opacity-70" />
                       )}
                     </div>
                   ) : (
                     <div className="rounded-md p-1.5 text-[10px] font-medium text-center text-slate-300 bg-slate-50 border border-dashed border-slate-200">
-                      OFF
+                      {onLeave ? 'Leave' : 'OFF'}
                     </div>
                   )}
                 </div>
@@ -1393,19 +2112,28 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
   };
 
   const getIntervalAccuracy = () => {
-    if (roster.length === 0 || volumeData.length === 0) return 0;
+    if (roster.length === 0 || processedVolume.length === 0) return 0;
     
     let totalRequired = 0;
     let totalAbsDiff = 0;
 
-    volumeData.forEach(day => {
+    processedVolume.forEach(day => {
       const dayReqs: Record<string, number> = {};
+      const allIntervalKeys = Object.keys(day.intervals).sort();
       Object.entries(day.intervals).forEach(([interval, val]) => {
-        const volume = Number(val) || 0;
-        const res = calculateRequiredAgents(volume, aht, targetSL, targetTime);
+        const duration = getIntervalDuration(interval, allIntervalKeys);
+        const effectiveVolume = Number(val) || 0;
+        let res;
+        if (channelType === 'chat' || channelType === 'whatsapp' || channelType === 'multiskill_chat_wa') {
+          res = calculateRequiredAgentsChat(effectiveVolume, aht, targetSL, targetTime, concurrency, duration);
+        } else if (channelType === 'email') {
+          res = calculateRequiredAgentsEmail(effectiveVolume, aht, targetSL, tat, duration);
+        } else {
+          res = calculateRequiredAgents(effectiveVolume, aht, targetSL, targetTime, duration);
+        }
         const req = Math.ceil(res.agents * (1 + shrinkage));
         dayReqs[interval] = req;
-        totalRequired += req;
+        totalRequired += req * duration;
       });
 
       const dayAssigned: Record<string, number> = {};
@@ -1417,7 +2145,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
           const code = shiftCodes.find(c => c.code === shiftCode);
           if (code) {
             Object.keys(dayReqs).forEach(interval => {
-              if (isIntervalInShift(interval, code.startTime, code.endTime)) {
+              if (isIntervalInShift(interval, code.startTime, code.endTime, extraHours)) {
                 dayAssigned[interval]++;
               }
             });
@@ -1440,9 +2168,18 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
     if (!day) return [];
 
     const dayReqs: Record<string, number> = {};
+    const allIntervalKeys = Object.keys(day.intervals).sort();
     Object.entries(day.intervals).forEach(([interval, val]) => {
+      const duration = getIntervalDuration(interval, allIntervalKeys);
       const volume = Number(val) || 0;
-      const res = calculateRequiredAgents(volume, aht, targetSL, targetTime);
+      let res;
+      if (channelType === 'chat' || channelType === 'whatsapp' || channelType === 'multiskill_chat_wa') {
+        res = calculateRequiredAgentsChat(volume, aht, targetSL, targetTime, concurrency, duration);
+      } else if (channelType === 'email') {
+        res = calculateRequiredAgentsEmail(volume, aht, targetSL, tat, duration);
+      } else {
+        res = calculateRequiredAgents(volume, aht, targetSL, targetTime, duration);
+      }
       dayReqs[interval] = Math.ceil(res.agents * (1 + shrinkage));
     });
 
@@ -1455,7 +2192,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
         const code = shiftCodes.find(c => c.code === shiftCode);
         if (code) {
           Object.keys(dayReqs).forEach(interval => {
-            if (isIntervalInShift(interval, code.startTime, code.endTime)) {
+            if (isIntervalInShift(interval, code.startTime, code.endTime, extraHours)) {
               dayAssigned[interval]++;
             }
           });
@@ -1535,6 +2272,162 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                 <Edit2 className="w-4 h-4" />
                 {isEditing ? "Finish Editing" : "Manual Edit"}
               </Button>
+              <Dialog 
+                open={isExtraTimeDialogOpen} 
+                onOpenChange={(open) => {
+                  if (open) {
+                    setTempExtraDays(extraWorkingDays);
+                    setTempExtraHours(extraHours);
+                  }
+                  setIsExtraTimeDialogOpen(open);
+                }}
+              >
+                <DialogTrigger asChild>
+                  <Button 
+                    variant="outline"
+                    size="sm"
+                    className="h-9 px-3 gap-2 border-slate-200 hover:bg-slate-50 transition-colors"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-bold text-slate-500 uppercase">Extra Days:</span>
+                      <span className="text-xs font-bold text-indigo-600">{extraWorkingDays}</span>
+                    </div>
+                    <div className="w-px h-3 bg-slate-200 mx-1" />
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-bold text-slate-500 uppercase">Extra Hours:</span>
+                      <span className="text-xs font-bold text-blue-600">{extraHours}</span>
+                    </div>
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="sm:max-w-[500px] max-h-[90vh] flex flex-col">
+                  <DialogHeader>
+                    <DialogTitle className="flex items-center gap-2">
+                      <Settings2 className="w-5 h-5 text-indigo-600" />
+                      Manage Extra Time Assignment
+                    </DialogTitle>
+                    <CardDescription>
+                      Configure additional working days and hours for your staff.
+                    </CardDescription>
+                  </DialogHeader>
+
+                  <div className="space-y-6 py-4 overflow-y-auto pr-2">
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <label className="text-xs font-bold text-slate-500 uppercase">Extra Working Days</label>
+                        <Input 
+                          type="number" 
+                          min="0" 
+                          max="10"
+                          value={tempExtraDays}
+                          onChange={(e) => setTempExtraDays(parseInt(e.target.value) || 0)}
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-xs font-bold text-slate-500 uppercase">Extra Hours (OT)</label>
+                        <Input 
+                          type="number" 
+                          min="0" 
+                          max="4"
+                          step="0.5"
+                          value={tempExtraHours}
+                          onChange={(e) => setTempExtraHours(parseFloat(e.target.value) || 0)}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="space-y-3">
+                      <label className="text-xs font-bold text-slate-500 uppercase">Assignment Scope</label>
+                      <div className="grid grid-cols-2 gap-2">
+                        <Button 
+                          variant={assignmentMode === 'all' ? 'default' : 'outline'}
+                          className={`justify-start gap-2 h-12 ${assignmentMode === 'all' ? 'bg-indigo-600' : ''}`}
+                          onClick={() => setAssignmentMode('all')}
+                        >
+                          <Users className="w-4 h-4" />
+                          <div className="text-left">
+                            <p className="text-sm font-bold">Apply to All</p>
+                            <p className="text-[10px] opacity-80 font-normal">Set as global default</p>
+                          </div>
+                        </Button>
+                        <Button 
+                          variant={assignmentMode === 'selected' ? 'default' : 'outline'}
+                          className={`justify-start gap-2 h-12 ${assignmentMode === 'selected' ? 'bg-indigo-600' : ''}`}
+                          onClick={() => setAssignmentMode('selected')}
+                        >
+                          <ListChecks className="w-4 h-4" />
+                          <div className="text-left">
+                            <p className="text-sm font-bold">Assign to Selected</p>
+                            <p className="text-[10px] opacity-80 font-normal">Target specific staff</p>
+                          </div>
+                        </Button>
+                      </div>
+                    </div>
+
+                    {assignmentMode === 'selected' && (
+                      <div className="space-y-3 animate-in fade-in slide-in-from-top-2 duration-200">
+                        <div className="flex items-center justify-between">
+                          <label className="text-xs font-bold text-slate-500 uppercase">Select Staff ({selectedEmpIds.size})</label>
+                          <Button 
+                            variant="ghost" 
+                            size="sm" 
+                            className="h-6 text-[10px] uppercase font-bold text-indigo-600"
+                            onClick={toggleSelectAllEmps}
+                          >
+                            {selectedEmpIds.size === employees.length ? 'Deselect All' : 'Select All'}
+                          </Button>
+                        </div>
+                        <div className="relative">
+                          <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-slate-400" />
+                          <Input 
+                            placeholder="Search staff..." 
+                            className="pl-8 h-8 text-xs"
+                            value={empSearchTerm}
+                            onChange={(e) => setEmpSearchTerm(e.target.value)}
+                          />
+                        </div>
+                        <div className="border rounded-lg max-h-[200px] overflow-y-auto divide-y">
+                          {employees
+                            .filter(e => e.name.toLowerCase().includes(empSearchTerm.toLowerCase()) || e.nip.includes(empSearchTerm))
+                            .map(emp => (
+                              <div 
+                                key={emp.id} 
+                                className={`flex items-center gap-3 p-2 hover:bg-slate-50 cursor-pointer transition-colors ${selectedEmpIds.has(emp.id) ? 'bg-indigo-50/50' : ''}`}
+                                onClick={() => toggleEmpSelect(emp.id)}
+                              >
+                                <Checkbox 
+                                  checked={selectedEmpIds.has(emp.id)}
+                                  onCheckedChange={() => toggleEmpSelect(emp.id)}
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-xs font-bold text-slate-900 truncate">{emp.name}</p>
+                                  <p className="text-[10px] text-slate-500">{emp.nip} • {emp.skill}</p>
+                                </div>
+                                {(emp.extraWorkingDays || emp.extraHours) ? (
+                                  <Badge variant="outline" className="text-[8px] h-4 px-1 border-indigo-100 text-indigo-600">
+                                    Current: {emp.extraWorkingDays}d/{emp.extraHours}h
+                                  </Badge>
+                                ) : null}
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <DialogFooter className="border-t pt-4">
+                    <Button variant="ghost" onClick={() => setIsExtraTimeDialogOpen(false)} disabled={isUpdatingExtra}>Cancel</Button>
+                    <Button 
+                      className="bg-indigo-600 hover:bg-indigo-700 gap-2" 
+                      onClick={handleApplyExtraTime}
+                      disabled={isUpdatingExtra || (assignmentMode === 'selected' && selectedEmpIds.size === 0)}
+                    >
+                      {isUpdatingExtra ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
+                      Confirm & Apply
+                    </Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
               {showClearConfirm ? (
                 <div className="flex gap-1 animate-in fade-in slide-in-from-right-2 duration-200">
                   <Button variant="destructive" size="sm" onClick={clearRoster} disabled={loading}>Confirm Clear</Button>
@@ -1550,7 +2443,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                   Clear Roster
                 </Button>
               )}
-              <Button onClick={generateBalancedRoster} disabled={loading} className="gap-2 bg-indigo-600 hover:bg-indigo-700 text-white">
+              <Button onClick={() => generateBalancedRoster('base')} disabled={loading} className="gap-2 bg-indigo-600 hover:bg-indigo-700 text-white">
                 {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
                 Generate Balanced Roster
               </Button>
@@ -1564,8 +2457,8 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
       </div>
 
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-50 p-4 rounded-xl border border-slate-100">
-        <div className="flex flex-1 items-center gap-2">
-          <div className="relative flex-1 max-w-sm">
+        <div className="flex flex-wrap items-center gap-4 flex-1">
+          <div className="relative flex-1 max-w-xs">
             <Activity className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
             <input 
               type="text"
@@ -1574,6 +2467,21 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
             />
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Period:</span>
+            <Select value={selectedMonth} onValueChange={setSelectedMonth}>
+              <SelectTrigger className="w-[140px] bg-white border-slate-200 h-9 text-sm">
+                <CalendarIcon className="w-4 h-4 mr-2 text-indigo-500" />
+                <SelectValue placeholder="Select Month" />
+              </SelectTrigger>
+              <SelectContent>
+                {availableMonths.map(m => (
+                  <SelectItem key={m} value={m}>{m}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
           <select 
             className="bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
@@ -1601,6 +2509,78 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
         </div>
       </div>
 
+      {shortageInfo && (
+        <Card className={`border-amber-200 animate-in fade-in slide-in-from-top-4 duration-300 ${shortageInfo.isCovered ? 'bg-emerald-50/30 border-emerald-200' : 'bg-amber-50/30'}`}>
+          <CardHeader className="pb-2">
+            <CardTitle className={`text-lg flex items-center gap-2 ${shortageInfo.isCovered ? 'text-emerald-800' : 'text-amber-800'}`}>
+              {shortageInfo.isCovered ? <CheckCircle2 className="w-5 h-5" /> : <AlertTriangle className="w-5 h-5" />}
+              {shortageInfo.isCovered ? 'Manpower Shortage Resolved' : 'Manpower Shortage Detected'}
+            </CardTitle>
+            <CardDescription className={shortageInfo.isCovered ? 'text-emerald-700' : 'text-amber-700'}>
+              {shortageInfo.isCovered 
+                ? 'Your current settings (Extra Days/Hours) are sufficient to cover the real forecast demand.' 
+                : 'The base employee capacity is insufficient to meet the real forecast demand.'}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div className="flex flex-col md:flex-row gap-6">
+              <div className="space-y-1">
+                <p className={`text-sm ${shortageInfo.isCovered ? 'text-emerald-900' : 'text-amber-900'}`}>
+                  Base gap: <span className="font-bold">{shortageInfo.baseShortage} shifts</span> missing.
+                  {shortageInfo.currentShortage > 0 && (
+                    <> Remaining gap: <span className="font-bold text-rose-600">{shortageInfo.currentShortage} shifts</span>.</>
+                  )}
+                </p>
+                <p className={`text-xs ${shortageInfo.isCovered ? 'text-emerald-700' : 'text-amber-700'}`}>
+                  {shortageInfo.isCovered 
+                    ? 'Click "Confirm & Apply Overtime" to generate the roster with these settings.'
+                    : `Suggested adjustment: +${shortageInfo.suggestedExtraDays} working days per employee.`}
+                </p>
+              </div>
+              <div className="h-10 w-px bg-slate-200 hidden md:block" />
+              <div className="space-y-1">
+                <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">Monthly FTE Requirement</p>
+                <div className="flex items-baseline gap-2">
+                  <span className="text-2xl font-bold text-indigo-600">{shortageInfo.grossFTE}</span>
+                  <span className="text-xs text-slate-400">Agents Needed</span>
+                </div>
+                <p className="text-[10px] text-slate-400 italic">Based on {shortageInfo.totalWorkHours.toLocaleString()} work hours</p>
+              </div>
+            </div>
+            <div className={`flex items-center gap-3 p-3 rounded-lg border shadow-sm ${shortageInfo.isCovered ? 'bg-white border-emerald-200' : 'bg-white border-amber-200'}`}>
+              {!shortageInfo.isCovered && (
+                <div className="text-center px-4 border-r border-amber-100">
+                  <p className="text-[10px] uppercase font-bold text-amber-500">Suggested Extra</p>
+                  <p className="text-xl font-bold text-amber-900">+{shortageInfo.suggestedExtraDays} Days</p>
+                </div>
+              )}
+              <div className="flex gap-2">
+                {!shortageInfo.isCovered && (
+                  <Button 
+                    size="sm" 
+                    variant="outline" 
+                    className="border-amber-300 text-amber-700 hover:bg-amber-100"
+                    onClick={() => updateExtraSettings(extraWorkingDays + shortageInfo.suggestedExtraDays, extraHours)}
+                  >
+                    Apply Suggestion
+                  </Button>
+                )}
+                <Button 
+                  size="sm" 
+                  variant="default" 
+                  className={`${shortageInfo.isCovered ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-amber-600 hover:bg-amber-700'} text-white gap-2`}
+                  onClick={() => generateBalancedRoster('overtime')}
+                  disabled={loading || (extraWorkingDays === 0 && extraHours === 0)}
+                >
+                  <Zap className="w-4 h-4" />
+                  Confirm & Apply Overtime
+                </Button>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {showAudit && (
         <Card className="border-rose-200 bg-rose-50/30 animate-in fade-in slide-in-from-top-4 duration-300">
           <CardHeader className="pb-2">
@@ -1608,9 +2588,23 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
               <ShieldCheck className="w-5 h-5" />
               Roster Health Audit Report
             </CardTitle>
-            <CardDescription className="text-rose-600">
-              Found {violations.length} violations that require attention.
-            </CardDescription>
+            <div className="flex items-center justify-between">
+              <CardDescription className="text-rose-600">
+                Found {violations.length} violations that require attention.
+              </CardDescription>
+              {violations.length > 0 && (
+                <Button 
+                  size="sm" 
+                  variant="outline" 
+                  className="text-rose-600 border-rose-200 hover:bg-rose-50 gap-2"
+                  onClick={handleBulkFix}
+                  disabled={loading}
+                >
+                  <Sparkles className="w-4 h-4" />
+                  Fix All Violations
+                </Button>
+              )}
+            </div>
           </CardHeader>
           <CardContent>
             {violations.length === 0 ? (
@@ -1621,21 +2615,79 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
             ) : (
               <div className="space-y-3 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
                 {violations.map((v, i) => (
-                  <div key={i} className="bg-white border border-rose-100 rounded-lg p-3 flex items-start gap-3 shadow-sm">
-                    <div className={`mt-0.5 p-1 rounded-full ${v.type === 'REST' ? 'bg-red-100 text-red-600' : 'bg-orange-100 text-orange-600'}`}>
-                      <AlertCircle className="w-4 h-4" />
+                  <div key={i} className={`border rounded-lg p-3 flex items-start gap-3 shadow-sm ${
+                    v.type === 'REST' ? 'bg-white border-rose-100' : 
+                    v.type === 'CONSECUTIVE' ? 'bg-white border-amber-100' : 
+                    'bg-white border-slate-100'
+                  }`}>
+                    <div className={`mt-0.5 p-1 rounded-full ${
+                      v.type === 'REST' ? 'bg-red-100 text-red-600' : 
+                      v.type === 'CONSECUTIVE' ? 'bg-orange-100 text-orange-600' : 
+                      'bg-slate-100 text-slate-600'
+                    }`}>
+                      {v.type === 'JUMP' ? <Clock className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
                     </div>
                     <div className="flex-1">
                       <div className="flex items-center justify-between mb-1">
                         <span className="font-bold text-slate-900 text-sm">{v.employeeName}</span>
-                        <Badge variant="outline" className="text-[10px] uppercase">{format(new Date(v.date), 'MMM d, yyyy')}</Badge>
+                        <div className="flex items-center gap-2">
+                          <Badge variant="outline" className={`text-[10px] uppercase ${
+                            v.type === 'REST' ? 'text-rose-600 border-rose-200' : 
+                            v.type === 'CONSECUTIVE' ? 'text-amber-600 border-amber-200' : 
+                            'text-slate-500 border-slate-200'
+                          }`}>
+                            {v.type === 'REST' ? 'REST VIOLATION' : 
+                             v.type === 'CONSECUTIVE' ? 'CONSECUTIVE WORK' : 
+                             'NOT RECOMMENDED (JUMP)'}
+                          </Badge>
+                          <Badge variant="outline" className="text-[10px] uppercase">{format(new Date(v.date), 'MMM d, yyyy')}</Badge>
+                        </div>
                       </div>
                       <p className="text-xs text-slate-600 mb-2">
-                        <span className="font-semibold text-rose-700">{v.type}:</span> {v.details}
+                        <span className={`font-semibold ${
+                          v.type === 'REST' ? 'text-rose-700' : 
+                          v.type === 'CONSECUTIVE' ? 'text-amber-700' : 
+                          'text-slate-700'
+                        }`}>{v.type}:</span> {v.details}
                       </p>
-                      <div className="bg-slate-50 rounded p-2 flex items-center gap-2 border border-slate-100">
-                        <ArrowRight className="w-3 h-3 text-indigo-500" />
-                        <span className="text-[11px] text-slate-500 italic">Suggestion: {v.suggestion}</span>
+                      <div className="bg-slate-50 rounded p-2 flex flex-col sm:flex-row sm:items-center justify-between gap-3 border border-slate-100">
+                        <div className="flex items-center gap-2">
+                          <ArrowRight className="w-3 h-3 text-indigo-500" />
+                          <span className="text-[11px] text-slate-500 italic">Suggestion: {v.suggestion}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <Button 
+                            size="sm" 
+                            variant="default" 
+                            className="h-7 px-3 text-[10px] bg-indigo-600 hover:bg-indigo-700 gap-1"
+                            onClick={() => handleQuickFix(v)}
+                          >
+                            <Zap className="w-3 h-3" />
+                            Quick Fix
+                          </Button>
+                          <Select 
+                            value={v.currentShift} 
+                            onValueChange={(val) => handleManualShiftChange(v.employeeId, v.date, val)}
+                          >
+                            <SelectTrigger className="h-7 text-[10px] w-24 bg-white">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="OFF">OFF</SelectItem>
+                              {shiftCodes.map(sc => (
+                                <SelectItem key={sc.code} value={sc.code}>{sc.code}</SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <Button 
+                            size="sm" 
+                            variant="outline" 
+                            className="h-7 px-2 text-[10px] text-rose-600 hover:text-rose-700 hover:bg-rose-50 border-rose-200"
+                            onClick={() => handleManualShiftChange(v.employeeId, v.date, 'OFF')}
+                          >
+                            Set OFF
+                          </Button>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -1668,7 +2720,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                 <div>
                   <div className="flex justify-between items-end mb-1">
                     <span className="text-2xl font-bold">
-                      {Math.round(((roster.length * (roster[0]?.targetWorkingDays || 0)) / (totalDemand || 1)) * 100)}%
+                      {Math.round(((shortageInfo?.effectiveSupply || 0) / (totalDemand || 1)) * 100)}%
                     </span>
                     <span className="text-xs text-indigo-100 font-medium">Coverage</span>
                   </div>
@@ -1676,7 +2728,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                     <div 
                       className="h-full bg-white transition-all duration-500 ease-out"
                       style={{ 
-                        width: `${Math.min(100, (roster.length * (roster[0]?.targetWorkingDays || 0)) / (totalDemand || 1) * 100)}%` 
+                        width: `${Math.min(100, (shortageInfo?.effectiveSupply || 0) / (totalDemand || 1) * 100)}%` 
                       }}
                     />
                   </div>
@@ -1688,7 +2740,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                   </div>
                   <div className="bg-white/10 rounded-lg p-2 backdrop-blur-sm">
                     <p className="text-[10px] uppercase font-bold text-indigo-100 mb-1">Supply</p>
-                    <p className="text-lg font-bold">{roster.length * (roster[0]?.targetWorkingDays || 0)}</p>
+                    <p className="text-lg font-bold">{shortageInfo?.effectiveSupply ? Math.round(shortageInfo.effectiveSupply) : 0}</p>
                   </div>
                 </div>
               </div>
@@ -1700,9 +2752,9 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
             <MetricCard 
               title="Monthly Target" 
-              value={roster.length > 0 ? `${roster[0]?.targetWorkingDays}W / ${roster[0]?.targetOffDays}O` : '-'}
+              value={roster.length > 0 ? `${roster[0]?.targetWorkingDays}W / ${roster[0]?.targetOffDays}O${targetHolidays > 0 ? ` (${targetHolidays}H)` : ''}` : '-'}
               icon={<Target className="w-4 h-4 text-blue-500" />}
-              description="Standard work/off ratio"
+              description={targetHolidays > 0 ? "Includes holidays as OFF" : "Standard work/off ratio"}
             />
             <MetricCard 
               title="Roster Precision" 
@@ -1861,12 +2913,19 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
           </div>
           <div className="space-y-1">
             <h3 className="font-bold text-blue-900 text-sm">Roster Insights & Logic</h3>
-            <p className="text-xs text-blue-700 leading-relaxed max-w-4xl">
-              Our AI-powered engine prioritizes <strong>Forecast Requirements</strong> to ensure optimal coverage. 
-              The system automatically enforces <strong>Forward Rotation</strong> (Morning → Afternoon → Night) to maintain staff health, 
-              while balancing working days against your monthly reference targets. 
-              <span className="block mt-1 opacity-80 italic">Note: If supply is lower than demand, the system will highlight coverage gaps in the Capacity Overview.</span>
-            </p>
+            <div className="text-xs text-blue-700 leading-relaxed max-w-4xl space-y-2">
+              <p>
+                <strong>Manpower Shortage Detection:</strong> Compares your <strong>Monthly FTE Requirement</strong> (based on AI Forecast) against your <strong>Total Available Shifts</strong>. 
+                This indicator shows the <strong>Real Demand</strong> without hidden buffers, helping you see the exact gap to be filled.
+              </p>
+              <p>
+                <strong>Extra Working Days:</strong> Increases the monthly target working days per employee. This improves <strong>Coverage</strong> but reduces rest days, which may increase <em>6-Day Compliance</em> violations.
+              </p>
+              <p>
+                <strong>Extra Hours (+Nh):</strong> Extends the effective duration of every assigned shift (e.g., 8h → 9h). This is reflected by a <span className="inline-flex items-center px-1 bg-indigo-600 text-white rounded-full text-[7px] font-black">+Nh</span> badge on shifts. 
+                It helps meet demand with fewer staff but reduces mandatory rest periods between shifts.
+              </p>
+            </div>
           </div>
         </CardContent>
       </Card>
@@ -1995,6 +3054,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                       </TableCell>
                       {volumeData.map((day, dayIdx) => {
                         const shift = emp.days[day.date] || 'OFF';
+                        const onLeave = isApprovedLeave(emp.employeeId, day.date);
                         const prevDayDate = dayIdx > 0 ? volumeData[dayIdx - 1].date : null;
                         const prevShiftCode = prevDayDate ? emp.days[prevDayDate] : null;
                         
@@ -2009,7 +3069,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                             const sPrev = shiftCodes.find(sc => sc.code === prevShiftCode);
                             const sCurr = shiftCodes.find(sc => sc.code === shift);
                             if (sPrev && sCurr) {
-                              const restMins = getRestHours(sPrev, sCurr);
+                              const restMins = getRestHours(sPrev, sCurr, extraHours);
                               if (restMins < 11 * 60) {
                                 restViolation = true;
                                 restHours = Math.round(restMins / 60 * 10) / 10;
@@ -2038,7 +3098,7 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                                   value={shift} 
                                   onValueChange={(val) => handleManualShiftChange(emp.employeeId, day.date, val)}
                                 >
-                                  <SelectTrigger className={`text-[10px] px-1 h-6 min-w-[45px] justify-center font-bold border-dashed ${getShiftBadgeClasses(shift, restViolation, consecViolation)}`}>
+                                  <SelectTrigger className={`text-[10px] px-1 h-6 min-w-[45px] justify-center font-bold border-dashed ${getShiftBadgeClasses(shift, restViolation, consecViolation, onLeave)}`}>
                                     <SelectValue placeholder={shift} />
                                   </SelectTrigger>
                                   <SelectContent>
@@ -2051,15 +3111,20 @@ export default function RosterView({ isAdmin }: { isAdmin: boolean }) {
                               ) : (
                                 <Badge 
                                   variant="outline" 
-                                  className={`text-[10px] px-1 h-6 min-w-[40px] justify-center font-bold ${getShiftBadgeClasses(shift, restViolation, consecViolation)}`}
+                                  className={`text-[10px] px-1 h-6 min-w-[40px] justify-center font-bold ${getShiftBadgeClasses(shift, restViolation, consecViolation, onLeave)}`}
                                   title={
                                     restViolation ? `Rest Violation: Only ${restHours}h rest` : 
                                     consecViolation ? `6-Day Compliance Violation: ${consecDays} consecutive days` : 
                                     undefined
                                   }
                                 >
-                                  {shift}
+                                  {onLeave ? 'Leave' : shift}
                                 </Badge>
+                              )}
+                              {shift !== 'OFF' && (emp.extraHours || 0) > 0 && (
+                                <div className="absolute -bottom-1.5 -right-1.5 bg-indigo-600 text-white text-[7px] px-1 rounded-full font-black border border-white shadow-sm z-10">
+                                  +{(emp.extraHours || 0)}h
+                                </div>
                               )}
                               {(restViolation || consecViolation) && (
                                 <div className="absolute -top-1 -right-1 bg-white rounded-full">
