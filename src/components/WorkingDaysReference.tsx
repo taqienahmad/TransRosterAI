@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { db, collection, onSnapshot, query, setDoc, doc, deleteDoc, OperationType, handleFirestoreError } from '../lib/firebase';
+import { db, collection, onSnapshot, query, setDoc, doc, deleteDoc, OperationType, handleFirestoreError, writeBatch } from '../lib/firebase';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -12,6 +12,8 @@ interface WorkingDayRef {
   month: string; // e.g., "Jan-25"
   totalDays: number;
   workingDays: number;
+  weekend: number;
+  holiday: number;
   offday: number;
 }
 
@@ -56,14 +58,18 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
         // Skip header
         for (let i = 1; i < lines.length; i++) {
           const parts = lines[i].split(separator).map(p => p.trim());
-          if (parts.length >= 4) {
+          if (parts.length >= 5) {
             const month = parts[0];
-            const data: WorkingDayRef = {
+            const weekend = parseInt(parts[3]) || 0;
+            const holiday = parseInt(parts[4]) || 0;
+            const data = {
               id: month,
               month: month,
               totalDays: parseInt(parts[1]) || 0,
               workingDays: parseInt(parts[2]) || 0,
-              offday: parseInt(parts[3]) || 0
+              weekend: weekend,
+              holiday: holiday,
+              offday: weekend + holiday
             };
 
             await setDoc(doc(db, 'workingDaysRef', data.id), data);
@@ -73,8 +79,8 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
         
         toast.success(`Successfully uploaded ${successCount} references`);
       } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, 'workingDaysRef/upload');
         toast.error('Failed to process CSV file');
-        console.error(err);
       }
     };
     reader.readAsText(file);
@@ -91,19 +97,32 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
   };
 
   const handleClearAll = async () => {
-    if (!isAdmin) return;
+    if (!isAdmin || references.length === 0) return;
     
     try {
-      const promises = references.map(ref => deleteDoc(doc(db, 'workingDaysRef', ref.id)));
-      await Promise.all(promises);
+      const batchSize = 500;
+      const chunks = [];
+      for (let i = 0; i < references.length; i += batchSize) {
+        chunks.push(references.slice(i, i + batchSize));
+      }
+
+      for (const chunk of chunks) {
+        const batch = writeBatch(db);
+        chunk.forEach(ref => {
+          batch.delete(doc(db, 'workingDaysRef', ref.id));
+        });
+        await batch.commit();
+      }
+
       toast.success('All reference data cleared');
     } catch (error) {
+      console.error('Clear data error:', error);
       toast.error('Failed to clear data');
     }
   };
 
   const downloadTemplate = () => {
-    const csvContent = "Bulan;Total Hari;Working Days;Offday\nJan-25;31;22;9\nFeb-25;28;20;8";
+    const csvContent = "Bulan;Total Hari;Working Days;Weekend;Holiday\nJan-25;31;22;8;1\nFeb-25;28;20;8;0";
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -156,7 +175,8 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
                 <TableHead>Month</TableHead>
                 <TableHead className="text-center">Total Days</TableHead>
                 <TableHead className="text-center">Working Days</TableHead>
-                <TableHead className="text-center">Offday</TableHead>
+                <TableHead className="text-center">Weekend</TableHead>
+                <TableHead className="text-center">Holiday</TableHead>
                 {isAdmin && <TableHead className="text-right">Actions</TableHead>}
               </TableRow>
             </TableHeader>
@@ -173,7 +193,8 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
                     <TableCell className="font-bold text-slate-900">{ref.month}</TableCell>
                     <TableCell className="text-center">{ref.totalDays}</TableCell>
                     <TableCell className="text-center font-medium text-emerald-600">{ref.workingDays}</TableCell>
-                    <TableCell className="text-center">{ref.offday}</TableCell>
+                    <TableCell className="text-center">{ref.weekend}</TableCell>
+                    <TableCell className="text-center">{ref.holiday}</TableCell>
                     {isAdmin && (
                       <TableCell className="text-right">
                         <Button 

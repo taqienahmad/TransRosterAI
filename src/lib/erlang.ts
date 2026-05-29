@@ -73,11 +73,26 @@ export function getIntervalDuration(interval: string, allIntervals: string[]): n
 }
 
 /**
+ * Workload-based requirement calculation (Replacement for Erlang C logic)
+ * formula: workload = (volume * AHT) / 3600
+ */
+export function calculateRequiredAgentsWorkload(
+  volume: number,
+  aht: number,
+  intervalDuration: number = 1
+): number {
+  if (volume <= 0) return 0;
+  // Intensity in standard workload units (ERL)
+  const intensity = (volume * aht) / (3600 * intervalDuration);
+  return intensity; // Base agents needed before shrinkage
+}
+
+/**
  * Finds the minimum number of agents to meet a service level target
  * @param volume Volume in the interval
  * @param aht Average Handling Time in seconds
  * @param targetSL Service Level target (e.g., 0.8 for 80%)
- * @param targetTime Target time in seconds (e.g., 20)
+ * @param targetTime The response time target (e.g. FRT for Chat, TAT for Email, TST for Call)
  * @param intervalDuration Duration of the interval in hours (default 1)
  */
 export function calculateRequiredAgents(
@@ -94,20 +109,24 @@ export function calculateRequiredAgents(
   // Normalize volume to hourly rate for Erlang C
   const callsPerHour = volume / intervalDuration;
   const intensity = (callsPerHour * aht) / 3600;
-  let agents = Math.ceil(intensity) + 1;
+  
+  // For very long target times (like TAT for email), Erlang-C behaves like a linear workload model.
+  // We ensure agents > intensity to maintain stability in a queuing model.
+  let agents = Math.ceil(intensity + 0.001);
 
   while (true) {
     const pw = calculateErlangC(intensity, agents);
+    // Standard Erlang C SL formula
     const sl = 1 - pw * Math.exp(-(agents - intensity) * (targetTime / aht));
     const occupancy = intensity / agents;
 
-    if (sl >= targetSL || agents > 1000) {
+    if (sl >= targetSL || agents > 2000) {
       return {
         agents,
         serviceLevel: sl,
         occupancy,
         waitingProbability: pw,
-        averageSpeedOfAnswer: (pw * aht) / (agents - intensity)
+        averageSpeedOfAnswer: (pw * aht) / Math.max(0.001, agents - intensity)
       };
     }
     agents++;
@@ -115,20 +134,20 @@ export function calculateRequiredAgents(
 }
 
 /**
- * Staffing for Chat considering concurrency
+ * Staffing for Chat/Whatsapp considering concurrency and FRT (First Response Time)
  */
 export function calculateRequiredAgentsChat(
   volume: number,
   aht: number,
   targetSL: number,
-  targetTime: number,
+  frt: number,
   concurrency: number,
   intervalDuration: number = 1
 ): ErlangResult {
-  // 1. Calculate required concurrent sessions using standard Erlang C
-  const sessionResult = calculateRequiredAgents(volume, aht, targetSL, targetTime, intervalDuration);
+  // 1. Calculate required concurrent sessions using Erlang C with FRT as the target time
+  const sessionResult = calculateRequiredAgents(volume, aht, targetSL, frt, intervalDuration);
   
-  // 2. Divide sessions by concurrency to get agents
+  // 2. Divide sessions by concurrency to get physical agents
   const agents = Math.ceil(sessionResult.agents / concurrency);
   
   return {
@@ -148,6 +167,7 @@ export function calculateRequiredAgentsEmail(
   tat: number,
   intervalDuration: number = 1
 ): ErlangResult {
+  // Email uses TAT as the response time target in the Erlang calculation
   return calculateRequiredAgents(volume, aht, targetSL, tat, intervalDuration);
 }
 

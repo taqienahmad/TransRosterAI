@@ -1,17 +1,18 @@
 import React, { useState, useEffect } from 'react';
-import { db, collection, onSnapshot, query, orderBy, setDoc, doc, deleteDoc, OperationType, handleFirestoreError } from '../lib/firebase';
+import { db, collection, onSnapshot, query, orderBy, setDoc, doc, deleteDoc, OperationType, handleFirestoreError, writeBatch } from '../lib/firebase';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
-import { Users, UserPlus, Search, Trash2, Edit2, Upload, Download, FileSpreadsheet, CheckSquare, Square, Settings2, Zap } from 'lucide-react';
+import { Users, UserPlus, Search, Trash2, Edit2, Upload, Download, FileSpreadsheet, CheckSquare, Square, Settings2, Zap, ChevronLeft, ChevronRight } from 'lucide-react';
 import { toast } from 'sonner';
 import { Checkbox } from '@/components/ui/checkbox';
-import { writeBatch } from '../lib/firebase';
 import { ShiftCode } from './ShiftCodeManager';
 import { Label } from '@/components/ui/label';
+
+import { format, subDays, subMonths, addMonths, startOfMonth, endOfMonth, eachDayOfInterval } from 'date-fns';
 
 interface Employee {
   id: string;
@@ -29,6 +30,7 @@ interface Employee {
   preferredShifts?: string[];
   extraWorkingDays?: number;
   extraHours?: number;
+  rosterHistory?: Record<string, string>;
 }
 
 export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
@@ -58,6 +60,8 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
   const [isBulkUpdateOpen, setIsBulkUpdateOpen] = useState(false);
   const [bulkData, setBulkData] = useState({ extraWorkingDays: 0, extraHours: 0 });
   const [isUpdating, setIsUpdating] = useState(false);
+  const [legacyRoster, setLegacyRoster] = useState<Record<string, Record<string, string>>>({});
+  const [targetMonth, setTargetMonth] = useState(new Date()); // The month being PLANNED
 
   useEffect(() => {
     const q = query(collection(db, 'employees'), orderBy('name'));
@@ -71,21 +75,51 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
     const qShifts = query(collection(db, 'shiftCodes'));
     const unsubShifts = onSnapshot(qShifts, (snapshot) => {
       setShiftCodes(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as ShiftCode)));
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'shiftCodes');
+    });
+
+    const unsubLegacy = onSnapshot(collection(db, 'legacyRoster'), (snapshot) => {
+      const data: Record<string, Record<string, string>> = {};
+      snapshot.docs.forEach(doc => {
+        data[doc.id] = doc.data() as Record<string, string>;
+      });
+      setLegacyRoster(data);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'legacyRoster');
     });
 
     return () => {
       unsubscribe();
       unsubShifts();
+      unsubLegacy();
     };
   }, []);
 
   const downloadTemplate = () => {
-    const csvContent = "sep=;\nNo;NIP;Name;Skill;Channel;Site;Gender;Religion;PreferredShifts\n1;6011450;Abu Sofyan;MPBK;Call;Semarang;L;Islam;P37,NS\n2;6012118;Achmad Luthfi Zakiya;PBK;Call;Semarang;L;Islam;";
+    // Generate headers for the last 7 days of the month PRIOR to targetMonth
+    const historyMonth = subMonths(targetMonth, 1);
+    const lastDayHistory = endOfMonth(historyMonth);
+    const historyDates = [];
+    const historyDayNumbers = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = subDays(lastDayHistory, i);
+      historyDates.push(format(d, 'yyyy-MM-dd'));
+      historyDayNumbers.push(format(d, 'd')); // Use day number "24", "25" etc.
+    }
+
+    const headers = ["No", "NIP", "Name", "Email", "Skill", "Channel", "Site", "Gender", "Religion", "Role", "Department", "Skills", ...historyDayNumbers, "PreferredShifts", "ExtraWorkingDays", "ExtraHours"];
+    
+    // Updated example data with day numbers
+    const example1 = ["1", "2222070", "Ayuningtias Srikandini", "ayu@example.com", "Consul", "Live Chat", "Tegal", "F", "Moslem", "Agent", "Consul", "HB", ...historyDayNumbers.map((_, idx) => idx === 6 ? "NS" : idx < 2 ? "P1" : idx < 4 ? "OFF" : "P2"), "P37,NS", "2", "0"];
+    const example2 = ["2", "2222108", "Wiwi Aji Setianingsih", "wiwi@example.com", "Consul", "Live Chat", "Tegal", "F", "Moslem", "Agent", "Consul", "HB", ...historyDayNumbers.map((_, idx) => idx < 2 ? "OFF" : "P3"), "P31", "0", "0"];
+    
+    const csvContent = "sep=;\n" + headers.join(';') + "\n" + example1.join(';') + "\n" + example2.join(';');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'employee_template.csv';
+    a.download = `employee_template_${format(targetMonth, 'MMM_yyyy')}.csv`;
     a.click();
     window.URL.revokeObjectURL(url);
   };
@@ -123,40 +157,90 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
         };
         const separator = (Object.keys(counts) as Array<keyof typeof counts>).reduce((a, b) => counts[a] > counts[b] ? a : b);
         
-        const headers = firstLine.split(separator).map(h => h.trim().toLowerCase());
+        const headers = firstLine.split(separator).map(h => h.trim()); // Case sensitive for dates
+        const lowerHeaders = headers.map(h => h.toLowerCase());
         
         // Flexible header matching
         const requiredHeaders = ['nip', 'name', 'skill'];
-        const missingHeaders = requiredHeaders.filter(req => !headers.some(h => h.includes(req)));
+        const missingHeaders = requiredHeaders.filter(req => !lowerHeaders.some(h => h.includes(req)));
         
         if (missingHeaders.length > 0) {
           toast.error(`Missing required columns: ${missingHeaders.join(', ')}`);
-          console.log('Detected headers:', headers);
           return;
         }
 
+        const historyMonth = subMonths(targetMonth, 1);
+        const year = historyMonth.getFullYear();
+        const month = historyMonth.getMonth(); // 0-indexed
+
         let successCount = 0;
         let errorCount = 0;
+        const legacyBatch = writeBatch(db);
+        let hasLegacyData = false;
 
         for (let i = 1; i < lines.length; i++) {
           const values = lines[i].split(separator).map(v => v.trim());
           const empData: any = {};
+          const historyData: Record<string, string> = {};
           
           headers.forEach((header, index) => {
+            const hLower = header.toLowerCase();
             const mapping: any = {
               'nip': 'nip',
               'name': 'name',
+              'email': 'email',
               'skill': 'skill',
               'channel': 'channel',
               'site': 'site',
               'gender': 'gender',
               'religion': 'religion',
-              'preferred': 'preferredShifts'
+              'role': 'role',
+              'department': 'department',
+              'skills': 'skills',
+              'preferred': 'preferredShifts',
+              'extra working days': 'extraWorkingDays',
+              'extra hours': 'extraHours'
             };
-            // Find mapping that is contained in the header
-            const matchedKey = Object.keys(mapping).find(key => header.includes(key));
+            
+            // Check if header is a date (YYYY-MM-DD or simple numeric day)
+            if (header.match(/^\d{4}-\d{2}-\d{2}$/)) {
+              if (values[index]) {
+                historyData[header] = values[index].toUpperCase();
+              }
+              return;
+            } else if (header.match(/^\d{1,2}$/)) {
+              // Numeric day for previous month
+              const day = parseInt(header);
+              if (day >= 1 && day <= 31 && values[index]) {
+                const dateObj = new Date(year, month, day);
+                // Validate if day exists in that month (JS Date wraps e.g. Feb 30 to Mar 2)
+                if (dateObj.getMonth() === month) {
+                  const dateKey = format(dateObj, 'yyyy-MM-dd');
+                  historyData[dateKey] = values[index].toUpperCase();
+                }
+              }
+              return;
+            }
+
+            // Find mapping that is contained in the header (longest match first to avoid skill vs skills confusion)
+            const matchedKey = Object.keys(mapping)
+              .filter(key => hLower.includes(key))
+              .sort((a, b) => b.length - a.length)[0];
             if (matchedKey) {
-              empData[mapping[matchedKey]] = values[index];
+              let val = values[index];
+              const field = mapping[matchedKey];
+              
+              if (field === 'gender' && val) {
+                const g = val.toUpperCase();
+                if (g === 'M') val = 'L';
+                if (g === 'F') val = 'P';
+              }
+
+              if (field === 'extraWorkingDays' || field === 'extraHours') {
+                empData[field] = parseInt(val) || 0;
+              } else {
+                empData[field] = val;
+              }
             }
           });
 
@@ -165,6 +249,10 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
               if (empData.preferredShifts && typeof empData.preferredShifts === 'string') {
                 empData.preferredShifts = empData.preferredShifts.split(',').map((s: string) => s.trim().toUpperCase()).filter((s: string) => s.length > 0);
               }
+              if (empData.skills && typeof empData.skills === 'string') {
+                empData.skills = empData.skills.split(',').map((s: string) => s.trim()).filter((s: string) => s.length > 0);
+              }
+
               const id = empData.nip || Math.random().toString(36).substring(2, 9);
               await setDoc(doc(db, 'employees', id), { 
                 ...empData, 
@@ -172,8 +260,14 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
                 email: empData.email || '',
                 role: empData.role || empData.skill,
                 department: empData.department || empData.site || '',
-                skills: [] 
+                skills: empData.skills || [] 
               });
+
+              if (Object.keys(historyData).length > 0) {
+                legacyBatch.set(doc(db, 'legacyRoster', id), historyData, { merge: true });
+                hasLegacyData = true;
+              }
+
               successCount++;
             } catch (err) {
               console.error('Error uploading employee:', err);
@@ -184,6 +278,11 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
           }
         }
         
+        if (hasLegacyData) {
+          await legacyBatch.commit();
+          toast.success(`Uploaded history for ${successCount} employees`);
+        }
+
         if (successCount > 0) {
           toast.success(`Successfully uploaded ${successCount} employees`);
         }
@@ -310,21 +409,34 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
   const [isClearDialogOpen, setIsClearDialogOpen] = useState(false);
 
   const handleClearAll = async () => {
-    if (!isAdmin) return;
+    if (!isAdmin || employees.length === 0) return;
     try {
-      const promises = employees.map(emp => deleteDoc(doc(db, 'employees', emp.id)));
-      await Promise.all(promises);
+      const batchSize = 500;
+      const chunks = [];
+      for (let i = 0; i < employees.length; i += batchSize) {
+        chunks.push(employees.slice(i, i + batchSize));
+      }
+
+      for (const chunk of chunks) {
+        const batch = writeBatch(db);
+        chunk.forEach(emp => {
+          batch.delete(doc(db, 'employees', emp.id));
+        });
+        await batch.commit();
+      }
+
       toast.success('All employees cleared');
       setIsClearDialogOpen(false);
     } catch (error) {
+      console.error('Clear employees error:', error);
       toast.error('Failed to clear employees');
     }
   };
 
   const filteredEmployees = employees.filter(emp => 
-    emp.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    emp.email.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    emp.role.toLowerCase().includes(searchTerm.toLowerCase())
+    (emp.name || '').toLowerCase().includes((searchTerm || '').toLowerCase()) ||
+    (emp.email || '').toLowerCase().includes((searchTerm || '').toLowerCase()) ||
+    (emp.role || '').toLowerCase().includes((searchTerm || '').toLowerCase())
   );
 
   return (
@@ -333,6 +445,11 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
         <div>
           <h1 className="text-3xl font-bold tracking-tight text-slate-900">Employees</h1>
           <p className="text-slate-500">Manage your team members and their roles.</p>
+          <div className="mt-2 bg-indigo-50 border border-indigo-100 p-2 rounded-md inline-block">
+            <p className="text-[10px] text-indigo-700 leading-tight">
+              <span className="font-bold">Tip:</span> Your master sheet (with NIP & Name) can be used here <u>and</u> in Roster History.
+            </p>
+          </div>
         </div>
         
         {isAdmin && (
@@ -567,14 +684,39 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
 
       <Card className="border-none shadow-sm overflow-hidden">
         <CardHeader className="bg-white border-b border-slate-100 py-4">
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-            <Input 
-              placeholder="Search employees..." 
-              className="pl-10 bg-slate-50 border-none"
-              value={searchTerm}
-              onChange={e => setSearchTerm(e.target.value)}
-            />
+          <div className="flex flex-col md:flex-row gap-4 items-center">
+            <div className="relative flex-1 w-full">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+              <Input 
+                placeholder="Search employees..." 
+                className="pl-10 bg-slate-50 border-none h-10"
+                value={searchTerm}
+                onChange={e => setSearchTerm(e.target.value)}
+              />
+            </div>
+            
+            <div className="flex items-center gap-2 bg-slate-100 p-1 rounded-lg">
+              <Button 
+                variant="ghost" 
+                size="icon" 
+                className="h-8 w-8 hover:bg-white"
+                onClick={() => setTargetMonth(prev => subMonths(prev, 1))}
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </Button>
+              <div className="px-3 min-w-[140px] text-center">
+                <p className="text-[10px] font-black uppercase tracking-widest text-slate-500 leading-tight">View Context</p>
+                <p className="text-sm font-bold text-indigo-600 leading-tight">{format(targetMonth, 'MMMM yyyy')}</p>
+              </div>
+              <Button 
+                variant="ghost" 
+                size="icon" 
+                className="h-8 w-8 hover:bg-white"
+                onClick={() => setTargetMonth(prev => addMonths(prev, 1))}
+              >
+                <ChevronRight className="w-4 h-4" />
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent className="p-0">
@@ -595,6 +737,23 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
                 <TableHead>Channel</TableHead>
                 <TableHead>Site</TableHead>
                 <TableHead>Gender</TableHead>
+                {/* Last 7 Days of Prev Month Display (Dynamic Based on targetMonth) */}
+                {(() => {
+                  const historyMonth = subMonths(targetMonth, 1);
+                  const lastDayHistory = endOfMonth(historyMonth);
+                  const days = [];
+                  for (let i = 6; i >= 0; i--) {
+                    days.push(subDays(lastDayHistory, i));
+                  }
+                  return days.map(d => (
+                    <TableHead key={format(d, 'yyyy-MM-dd')} className="text-[9px] font-black uppercase tracking-widest text-indigo-500 text-center w-12 border-l border-slate-100 bg-indigo-50/20">
+                      <div className="flex flex-col items-center">
+                        <span className="text-[7px] opacity-70 leading-none mb-0.5">{format(d, 'MMM')}</span>
+                        <span className="text-[10px] leading-none">{format(d, 'dd')}</span>
+                      </div>
+                    </TableHead>
+                  ));
+                })()}
                 <TableHead>Extra D/H</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
@@ -632,6 +791,24 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
                     <TableCell className="text-slate-600 text-sm">{emp.channel || '-'}</TableCell>
                     <TableCell className="text-slate-600 text-sm">{emp.site || '-'}</TableCell>
                     <TableCell className="text-slate-600 text-sm">{emp.gender || '-'}</TableCell>
+                    {/* Last 7 Days values (Dynamic based on targetMonth) */}
+                    {(() => {
+                      const historyMonth = subMonths(targetMonth, 1);
+                      const lastDayHistory = endOfMonth(historyMonth);
+                      const days = [];
+                      for (let i = 6; i >= 0; i--) {
+                        days.push(format(subDays(lastDayHistory, i), 'yyyy-MM-dd'));
+                      }
+                      return days.map(dKey => {
+                        const shift = legacyRoster[emp.id]?.[dKey];
+                        const isNight = shift && shiftCodes.find(s => s.code === shift)?.isNightShift;
+                        return (
+                          <TableCell key={dKey} className={`text-[10px] font-bold text-center border-l border-slate-100 ${isNight ? 'bg-indigo-600 text-white' : shift === 'OFF' ? 'text-slate-300' : 'text-indigo-600'}`}>
+                            {shift || '-'}
+                          </TableCell>
+                        );
+                      });
+                    })()}
                     <TableCell>
                       <div className="flex flex-col gap-1">
                         {emp.extraWorkingDays ? <Badge variant="outline" className="text-[10px] text-indigo-600 border-indigo-100">+{emp.extraWorkingDays} Days</Badge> : null}
@@ -688,14 +865,14 @@ export default function EmployeeList({ isAdmin }: { isAdmin: boolean }) {
               <div className="space-y-2">
                 <label className="text-sm font-medium">Full Name</label>
                 <Input 
-                  value={editingEmployee.name} 
+                  value={editingEmployee.name || ''} 
                   onChange={e => setEditingEmployee({...editingEmployee, name: e.target.value})} 
                 />
               </div>
               <div className="space-y-2">
                 <label className="text-sm font-medium">Skill</label>
                 <Input 
-                  value={editingEmployee.skill} 
+                  value={editingEmployee.skill || ''} 
                   onChange={e => setEditingEmployee({...editingEmployee, skill: e.target.value})} 
                 />
               </div>

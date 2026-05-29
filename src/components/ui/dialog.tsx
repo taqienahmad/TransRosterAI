@@ -1,3 +1,5 @@
+"use client"
+
 import * as React from "react"
 import { Dialog as DialogPrimitive } from "@base-ui/react/dialog"
 
@@ -10,15 +12,18 @@ function Dialog({ ...props }: DialogPrimitive.Root.Props) {
 }
 
 function DialogTrigger({
+  children,
   asChild,
   ...props
 }: DialogPrimitive.Trigger.Props & { asChild?: boolean }) {
   return (
     <DialogPrimitive.Trigger
       data-slot="dialog-trigger"
-      render={asChild ? props.children : undefined}
+      render={asChild ? children : undefined}
       {...props}
-    />
+    >
+      {asChild ? undefined : children}
+    </DialogPrimitive.Trigger>
   )
 }
 
@@ -27,15 +32,18 @@ function DialogPortal({ ...props }: DialogPrimitive.Portal.Props) {
 }
 
 function DialogClose({
+  children,
   asChild,
   ...props
 }: DialogPrimitive.Close.Props & { asChild?: boolean }) {
   return (
     <DialogPrimitive.Close
       data-slot="dialog-close"
-      render={asChild ? props.children : undefined}
+      render={asChild ? children : undefined}
       {...props}
-    />
+    >
+      {asChild ? undefined : children}
+    </DialogPrimitive.Close>
   )
 }
 

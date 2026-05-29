@@ -1,3 +1,5 @@
+"use client"
+
 import * as React from "react"
 import { Select as SelectPrimitive } from "@base-ui/react/select"
 
@@ -47,15 +49,13 @@ function SelectTrigger({
       )}
       {...props}
     >
+      {asChild ? undefined : children}
       {!asChild && (
-        <>
-          {children}
-          <SelectPrimitive.Icon
-            render={
-              <ChevronDownIcon className="pointer-events-none size-4 text-muted-foreground" />
-            }
-          />
-        </>
+        <SelectPrimitive.Icon
+          render={
+            <ChevronDownIcon className="pointer-events-none size-4 text-muted-foreground" />
+          }
+        />
       )}
     </SelectPrimitive.Trigger>
   )

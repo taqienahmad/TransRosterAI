@@ -30,10 +30,12 @@ export const DEFAULT_WINDOWS: OperationalWindows = {
 
 export default function OperationalWindowSettings({ 
   windows, 
-  onUpdate 
+  onUpdate,
+  isAdmin = false
 }: { 
   windows?: OperationalWindows | null, 
-  onUpdate?: (windows: OperationalWindows) => void 
+  onUpdate?: (windows: OperationalWindows) => void,
+  isAdmin?: boolean
 }) {
   const [localWindows, setLocalWindows] = useState<OperationalWindows>(windows || DEFAULT_WINDOWS);
 
@@ -44,6 +46,7 @@ export default function OperationalWindowSettings({
   }, [windows]);
 
   const handleUpdate = (day: string, field: keyof DayWindow, value: any) => {
+    if (!isAdmin) return;
     const updated = {
       ...localWindows,
       [day]: {
@@ -55,6 +58,7 @@ export default function OperationalWindowSettings({
   };
 
   const handleSave = async () => {
+    if (!isAdmin) return;
     try {
       await setDoc(doc(db, 'erlangSettings', 'current'), { 
         operationalWindows: localWindows 
@@ -68,6 +72,7 @@ export default function OperationalWindowSettings({
   };
 
   const handleReset = () => {
+    if (!isAdmin) return;
     setLocalWindows(DEFAULT_WINDOWS);
     toast.info('Reset to 24/7 defaults. Click Save to apply.');
   };
@@ -85,16 +90,18 @@ export default function OperationalWindowSettings({
               <CardDescription>Define when your business is active each day.</CardDescription>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm" onClick={handleReset} className="gap-2">
-              <RotateCcw className="w-4 h-4" />
-              Reset
-            </Button>
-            <Button size="sm" onClick={handleSave} className="gap-2 bg-indigo-600 hover:bg-indigo-700">
-              <Save className="w-4 h-4" />
-              Save Changes
-            </Button>
-          </div>
+          {isAdmin && (
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={handleReset} className="gap-2">
+                <RotateCcw className="w-4 h-4" />
+                Reset
+              </Button>
+              <Button size="sm" onClick={handleSave} className="gap-2 bg-indigo-600 hover:bg-indigo-700">
+                <Save className="w-4 h-4" />
+                Save Changes
+              </Button>
+            </div>
+          )}
         </div>
       </CardHeader>
       <CardContent className="p-6">
@@ -107,6 +114,7 @@ export default function OperationalWindowSettings({
                   <Switch 
                     checked={config.isOpen} 
                     onCheckedChange={(checked) => handleUpdate(day, 'isOpen', checked)}
+                    disabled={!isAdmin}
                   />
                   <span className={`font-bold ${config.isOpen ? 'text-slate-900' : 'text-slate-400'}`}>{day}</span>
                 </div>
@@ -116,8 +124,8 @@ export default function OperationalWindowSettings({
                     <span className="text-[10px] font-bold text-slate-400 uppercase">Start</span>
                     <Input 
                       type="time" 
-                      value={config.start} 
-                      disabled={!config.isOpen}
+                      value={config.start || ''} 
+                      disabled={!config.isOpen || !isAdmin}
                       onChange={(e) => handleUpdate(day, 'start', e.target.value)}
                       className="w-32 h-9 text-sm"
                     />
@@ -126,8 +134,8 @@ export default function OperationalWindowSettings({
                     <span className="text-[10px] font-bold text-slate-400 uppercase">End</span>
                     <Input 
                       type="time" 
-                      value={config.end} 
-                      disabled={!config.isOpen}
+                      value={config.end || ''} 
+                      disabled={!config.isOpen || !isAdmin}
                       onChange={(e) => handleUpdate(day, 'end', e.target.value)}
                       className="w-32 h-9 text-sm"
                     />

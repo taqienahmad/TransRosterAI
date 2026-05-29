@@ -34,7 +34,8 @@ import firebaseConfig from '../../firebase-applet-config.json';
 
 const app = initializeApp(firebaseConfig);
 
-// Initialize Firestore with settings to handle potential connectivity issues in iframe/restricted environments
+// Initialize Firestore with settings to handle potential connectivity issues in iframe/restricted environments.
+// experimentalForceLongPolling is often necessary in AI Studio's preview iframe to avoid WebSocket connection failures.
 export const db = initializeFirestore(app, {
   experimentalForceLongPolling: true,
 }, firebaseConfig.firestoreDatabaseId || '(default)');
@@ -69,19 +70,36 @@ export type { User };
 async function testConnection() {
   try {
     console.log("Testing Firestore connection...");
-    await enableNetwork(db);
+    console.log("Database ID:", firebaseConfig.firestoreDatabaseId || '(default)');
+    console.log("Project ID:", firebaseConfig.projectId);
+    
+    // Check auth status
+    onAuthStateChanged(auth, (user) => {
+      if (user) {
+        console.log("Auth State: Signed in as", user.email, "(Verified:", user.emailVerified, ")");
+      } else {
+        console.log("Auth State: Signed out");
+      }
+    });
+
     // Use getDocFromServer to bypass local cache and test real connectivity
-    await getDocFromServer(doc(db, 'test', 'connection'));
+    // Path /test/connection is allowed for read in firestore.rules
+    const testDoc = doc(db, 'test', 'connection');
+    await getDocFromServer(testDoc);
     console.log("Firestore connection successful.");
   } catch (error) {
     if (error instanceof Error) {
-      if (error.message.includes('the client is offline')) {
-        console.error("Firestore connection failed: The client is reporting as offline. Please check your network and Firebase configuration.");
+      console.error("Firestore connection failed with error code:", (error as any).code);
+      console.error("Error message:", error.message);
+      
+      if (error.message.includes('the client is offline') || (error as any).code === 'unavailable') {
+        console.error("Firestore connection failed: The backend is unreachable. This usually means:");
+        console.error("1. The Firestore Database ID is incorrect.");
+        console.error("2. Cloud Firestore API is not enabled for this project.");
+        console.error("3. Network/Iframe restrictions are blocking the connection.");
+        console.error("4. The project is currently being provisioned.");
       } else if (error.message.includes('Missing or insufficient permissions')) {
-        // This is acceptable if the document is protected, but we've made it public for testing
-        console.warn("Firestore connection: Connected, but received permission error for test document. This is expected if the document is protected.");
-      } else {
-        console.error("Firestore connection test failed with unexpected error:", error.message);
+        console.warn("Firestore connection: Connected, but received permission error for test document. This is expected if the document is protected, but the 'test/connection' rule should allow public read.");
       }
     } else {
       console.error("Firestore connection test failed with unknown error:", error);

@@ -75,15 +75,25 @@ service cloud.firestore {
     // ===============================================================
     // Helper Functions
     // ===============================================================
-    function isAuthenticated() {
+    function isSignedIn() {
       return request.auth != null;
     }
 
+    function isAuthenticated() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
     function isAdmin() {
-      return isAuthenticated() && 
-             ((request.auth.token.email == "taqienahmad@gmail.com" && request.auth.token.email_verified == true) ||
-              (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-               get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'));
+      return isSignedIn() && (
+        request.auth.token.email == "taqienahmad@gmail.com" ||
+        request.auth.token.email == "admin@transroster.ai" ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin")
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
     function isOwner(userId) {
@@ -131,7 +141,24 @@ service cloud.firestore {
              data.date is string && data.date.matches("^\\d{4}-\\d{2}-\\d{2}$") &&
              data.day is string &&
              data.totalVolume is number &&
-             data.intervals is map;
+             data.intervals is map &&
+             (!('baselineVolume' in data) || data.baselineVolume is number) &&
+             (!('eventApplied' in data) || (data.eventApplied is map || data.eventApplied == null)) &&
+             (!('metadata' in data) || (
+               data.metadata is map &&
+               (!('methodUsed' in data.metadata) || data.metadata.methodUsed is string) &&
+               (!('modeUsed' in data.metadata) || data.metadata.modeUsed is string) &&
+               (!('eventImpact' in data.metadata) || data.metadata.eventImpact is number)
+             ));
+    }
+
+    function isValidForecastEvent(data) {
+      return data.keys().hasAll(['date', 'type', 'impact']) &&
+             data.date is string && data.date.matches("^\\d{4}-\\d{2}-\\d{2}$") &&
+             data.type in ['campaign', 'payday', 'holiday', 'other'] &&
+             data.impact is number &&
+             (!('description' in data) || (data.description is string || data.description == null)) &&
+             (!('event_window_pattern' in data) || data.event_window_pattern is list);
     }
 
     function isValidHistoricalVolume(data) {
@@ -173,102 +200,140 @@ service cloud.firestore {
              (!('reason' in data) || (data.reason is string || data.reason == null));
     }
 
+    function isValidTask(data) {
+      return data.keys().hasAll(['title', 'priority', 'status', 'createdBy']) &&
+             data.title is string && data.title.size() > 0 &&
+             data.priority in ['high', 'medium', 'low'] &&
+             data.status in ['todo', 'in-progress', 'done'] &&
+             data.createdBy is string &&
+             (!('description' in data) || data.description is string) &&
+             (!('assignedTo' in data) || data.assignedTo is string) &&
+             (!('assignedName' in data) || data.assignedName is string) &&
+             (!('dueDate' in data) || data.dueDate is string) &&
+             (!('createdAt' in data) || data.createdAt is string);
+    }
+
+    function isValidLegacyRoster(data) {
+      return data.keys().hasAll(['employeeId']) &&
+             data.employeeId is string &&
+             (!('shifts' in data) || data.shifts is map);
+    }
+
+    function isValidSchedulingConstraints(data) {
+      return (!('restHours' in data) || data.restHours is number) &&
+             (!('maxConsecutive' in data) || data.maxConsecutive is number) &&
+             (!('stabilityBonus' in data) || data.stabilityBonus is number) &&
+             (!('backwardJumpPenalty' in data) || data.backwardJumpPenalty is number) &&
+             (!('forwardRotationBonus' in data) || data.forwardRotationBonus is number) &&
+             (!('penaltyRest' in data) || data.penaltyRest is number) &&
+             (!('penaltyConsec1' in data) || data.penaltyConsec1 is number) &&
+             (!('penaltyConsec2' in data) || data.penaltyConsec2 is number) &&
+             (!('penaltyConsec3' in data) || data.penaltyConsec3 is number) &&
+             (!('penaltyOverTarget' in data) || data.penaltyOverTarget is number) &&
+             (!('preferenceBonus' in data) || data.preferenceBonus is number) &&
+             (!('criticalBonus' in data) || data.criticalBonus is number) &&
+             (!('maleNightShiftBonus' in data) || data.maleNightShiftBonus is number) &&
+             (!('ignoreCeiling' in data) || data.ignoreCeiling is bool);
+    }
+
     // ===============================================================
     // Rules
     // ===============================================================
 
     match /users/{userId} {
-      allow read: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
-      allow create: if isAuthenticated() && request.auth.uid == userId;
-      allow update: if isAdmin();
+      allow read, create: if isSignedIn() && request.auth.uid == userId;
+      allow update, delete: if isAdmin();
     }
 
     match /employees/{employeeId} {
-      allow read: if isAuthenticated();
-      allow create, update: if isAdmin() && isValidEmployee(request.resource.data);
-      allow delete: if isAdmin();
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
 
     match /shifts/{shiftId} {
-      allow read: if isAuthenticated();
-      allow create, update: if isAdmin() && isValidShift(request.resource.data);
-      allow delete: if isAdmin();
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
 
     match /forecasts/{forecastId} {
-      allow read: if isAuthenticated();
-      allow create, update: if isAdmin() && isValidForecast(request.resource.data);
-      allow delete: if isAdmin();
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
 
     match /shiftCodes/{codeId} {
-      allow read: if isAuthenticated();
-      allow create, update: if isAdmin() && isValidShiftCode(request.resource.data);
-      allow delete: if isAdmin();
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
 
     match /forecastVolume/{date} {
-      allow read: if isAuthenticated();
-      allow create, update: if isAdmin() && isValidForecastVolume(request.resource.data);
-      allow delete: if isAdmin();
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /forecastEvents/{date} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
 
     match /historicalVolume/{date} {
-      allow read: if isAuthenticated();
-      allow create, update: if isAdmin() && isValidHistoricalVolume(request.resource.data);
-      allow delete: if isAdmin();
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
 
     match /workingDaysRef/{month} {
-      allow read: if isAuthenticated();
-      allow create, update: if isAdmin() && isValidWorkingDaysRef(request.resource.data);
-      allow delete: if isAdmin();
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
 
     match /erlangResults/{id} {
-      allow read: if isAuthenticated();
-      allow create, update: if isAdmin() && isValidErlangResult(request.resource.data);
-      allow delete: if isAdmin();
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
 
     match /erlangSettings/{id} {
-      allow read: if isAuthenticated();
+      allow read: if isSignedIn();
       allow write: if isAdmin();
     }
 
     match /roster/{id} {
-      allow read: if isAuthenticated();
+      allow read: if isSignedIn();
       allow write: if isAdmin();
     }
 
     match /leaveRequests/{requestId} {
-      // Allow read if user is admin, owner, or if the leave is approved (needed for roster visibility)
-      allow read: if isAuthenticated() && (
-        isAdmin() || 
-        (resource != null && resource.data.employeeId == request.auth.uid) ||
-        (resource != null && resource.data.status == 'approved')
-      );
+      // Allow read if user is logged in
+      allow read: if isSignedIn();
       
-      allow create: if isAuthenticated() && (
+      allow create: if isSignedIn() && (
                       isAdmin() || 
                       (request.resource.data.employeeId == request.auth.uid && 
-                       request.resource.data.status == 'pending' &&
-                       isValidLeaveRequest(request.resource.data))
+                       request.resource.data.status == 'pending')
                     );
                     
-      allow update: if isAuthenticated() && (
+      allow update: if isSignedIn() && (
         isAdmin() || 
-        (resource != null && request.auth.uid == resource.data.employeeId && 
-         request.resource.data.status == resource.data.status && 
-         isValidLeaveRequest(request.resource.data))
+        (resource.data.employeeId == request.auth.uid && 
+         request.resource.data.status == resource.data.status)
       );
       
-      allow delete: if isAdmin() || (
-        isAuthenticated() && 
-        resource != null && 
-        request.auth.uid == resource.data.employeeId && 
-        resource.data.status == 'pending'
-      );
+      allow delete: if isAdmin();
+    }
+
+    match /tasks/{taskId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.createdBy == request.auth.uid;
+      allow update: if isSignedIn() && (isAdmin() || resource.data.createdBy == request.auth.uid || resource.data.assignedTo == request.auth.uid);
+      allow delete: if isAdmin() || (resource.data.createdBy == request.auth.uid);
+    }
+
+    match /legacyRoster/{nip} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /schedulingConstraints/{id} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin() && isValidSchedulingConstraints(request.resource.data);
     }
 
     match /test/connection {

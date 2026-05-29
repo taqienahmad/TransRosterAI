@@ -68,10 +68,33 @@
       "properties": {
         "date": { "type": "string", "format": "date", "description": "The date in YYYY-MM-DD format." },
         "day": { "type": "string", "description": "Day of the week (e.g., Mon, Tue)." },
-        "totalVolume": { "type": "number", "description": "Total volume for the day." },
-        "intervals": { "type": "object", "description": "Map of time intervals to volume values." }
+        "totalVolume": { "type": "number", "description": "Total volume for the day (final)." },
+        "baselineVolume": { "type": "number", "description": "Calculated baseline volume before event adjustment." },
+        "eventApplied": { "type": "object", "description": "Details of the event adjustment applied." },
+        "intervals": { "type": "object", "description": "Map of time intervals to volume values." },
+        "metadata": {
+          "type": "object",
+          "properties": {
+            "methodUsed": { "type": "string" },
+            "modeUsed": { "type": "string" },
+            "eventImpact": { "type": "number" }
+          }
+        }
       },
       "required": ["date", "day", "totalVolume", "intervals"]
+    },
+    "ForecastEvent": {
+      "title": "Forecast Event",
+      "description": "Represents a calendar event that impacts forecasted volume.",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string", "format": "date", "description": "Date of the event." },
+        "type": { "type": "string", "enum": ["campaign", "payday", "holiday", "other"], "description": "Type of event." },
+        "impact": { "type": "number", "description": "Impact factor (e.g. 0.3 for +30%)." },
+        "description": { "type": "string", "description": "Short description of the event." },
+        "event_window_pattern": { "type": "array", "items": { "type": "number" }, "description": "Multipliers for [H-2, H-1, H, H+1, H+2]." }
+      },
+      "required": ["date", "type", "impact"]
     },
     "HistoricalVolume": {
       "title": "Historical Volume",
@@ -147,6 +170,55 @@
         "submittedAt": { "type": "string", "format": "date-time", "description": "When the request was submitted." }
       },
       "required": ["employeeId", "date", "status"]
+    },
+    "Task": {
+      "title": "Task",
+      "description": "Represents an administrative or operational task for the team.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique identifier for the task." },
+        "title": { "type": "string", "description": "Short title of the task." },
+        "description": { "type": "string", "description": "Detailed description." },
+        "priority": { "type": "string", "enum": ["high", "medium", "low"], "description": "Urgency level." },
+        "status": { "type": "string", "enum": ["todo", "in-progress", "done"], "description": "Current status." },
+        "assignedTo": { "type": "string", "description": "ID of the employee assigned (optional)." },
+        "assignedName": { "type": "string", "description": "Name of the assigned employee." },
+        "createdBy": { "type": "string", "description": "ID of the user who created the task." },
+        "dueDate": { "type": "string", "format": "date", "description": "Completion deadline." },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp." }
+      },
+      "required": ["title", "priority", "status", "createdBy"]
+    },
+    "LegacyRoster": {
+      "title": "Legacy Roster",
+      "description": "Represents historical schedule data (last month's shifts) for an employee.",
+      "type": "object",
+      "properties": {
+        "employeeId": { "type": "string", "description": "The NIP or unique ID of the employee." },
+        "shifts": { "type": "object", "description": "Map of dates (YYYY-MM-DD) to shift codes." }
+      },
+      "required": ["employeeId"]
+    },
+    "SchedulingConstraints": {
+      "title": "Scheduling Constraints",
+      "description": "Configurable parameters for roster generation and simulation.",
+      "type": "object",
+      "properties": {
+        "restHours": { "type": "number" },
+        "maxConsecutive": { "type": "number" },
+        "stabilityBonus": { "type": "number" },
+        "backwardJumpPenalty": { "type": "number" },
+        "forwardRotationBonus": { "type": "number" },
+        "penaltyRest": { "type": "number" },
+        "penaltyConsec1": { "type": "number" },
+        "penaltyConsec2": { "type": "number" },
+        "penaltyConsec3": { "type": "number" },
+        "penaltyOverTarget": { "type": "number" },
+        "preferenceBonus": { "type": "number" },
+        "criticalBonus": { "type": "number" },
+        "maleNightShiftBonus": { "type": "number" },
+        "ignoreCeiling": { "type": "boolean" }
+      }
     }
   },
   "firestore": {
@@ -190,9 +262,25 @@
       "schema": "Roster",
       "description": "The published roster."
     },
+    "/forecastEvents/{date}": {
+      "schema": "ForecastEvent",
+      "description": "Collection of calendar events impacting forecasts."
+    },
     "/leaveRequests/{requestId}": {
       "schema": "LeaveRequest",
       "description": "Collection of employee leave requests."
+    },
+    "/tasks/{taskId}": {
+      "schema": "Task",
+      "description": "Collection of team tasks and action items."
+    },
+    "/legacyRoster/{nip}": {
+      "schema": "LegacyRoster",
+      "description": "Collection of historical employee rosters."
+    },
+    "/schedulingConstraints/{id}": {
+      "schema": "SchedulingConstraints",
+      "description": "Configurable parameters for roster generation."
     }
   }
 }

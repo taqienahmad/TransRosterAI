@@ -45,11 +45,14 @@ import { format } from 'date-fns';
 interface LeaveRequest {
   id: string;
   employeeId: string;
+  nip?: string;
   employeeName: string;
+  department?: string;
+  skill?: string;
   date: string;
   type: 'annual' | 'sick' | 'casual' | 'other';
   status: 'pending' | 'approved' | 'rejected';
-  reason?: string;
+  reason: string;
   submittedAt: string;
 }
 
@@ -80,6 +83,8 @@ export default function LeaveManagement({ isAdmin }: { isAdmin: boolean }) {
     const qEmp = query(collection(db, 'employees'), orderBy('name'));
     const unsubEmp = onSnapshot(qEmp, (snapshot) => {
       setEmployees(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Employee)));
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'employees');
     });
 
     const qReq = isAdmin 
@@ -161,12 +166,34 @@ export default function LeaveManagement({ isAdmin }: { isAdmin: boolean }) {
   const handleDownloadTemplate = () => {
     const data = [
       {
-        employee_id: 'emp_123',
-        employee_name: 'John Doe',
-        date: format(new Date(), 'yyyy-MM-dd'),
-        type: 'annual',
-        reason: 'Vacation',
-        status: 'pending'
+        NIP: '2230924',
+        Name: 'Loudy Nizar Khaidir',
+        Department: 'L2',
+        Skills: 'L2',
+        Date: '01/05/2026',
+        Type: 'Annual',
+        Reason: 'berkunjung ke rumah saudara',
+        Status: 'Pending'
+      },
+      {
+        NIP: '2241674',
+        Name: 'Jamallullail',
+        Department: 'L2',
+        Skills: 'L2',
+        Date: '02/05/2026',
+        Type: 'Annual',
+        Reason: 'acara luar kota',
+        Status: 'Pending'
+      },
+      {
+        NIP: '2242503',
+        Name: 'Refina Ardelia',
+        Department: 'L2',
+        Skills: 'L2',
+        Date: '04/05/2026',
+        Type: 'Annual',
+        Reason: 'jadi bridesmaid',
+        Status: 'Pending'
       }
     ];
 
@@ -175,8 +202,7 @@ export default function LeaveManagement({ isAdmin }: { isAdmin: boolean }) {
     XLSX.utils.book_append_sheet(workbook, worksheet, "Leave Template");
     
     // Auto-size columns
-    const max_width = data.reduce((w, r) => Math.max(w, r.employee_name.length), 10);
-    worksheet["!cols"] = [ { wch: 15 }, { wch: max_width + 5 }, { wch: 15 }, { wch: 12 }, { wch: 30 }, { wch: 12 } ];
+    worksheet["!cols"] = [ { wch: 15 }, { wch: 25 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 30 }, { wch: 12 } ];
 
     XLSX.writeFile(workbook, "leave_request_template.xlsx");
     toast.success('Excel template downloaded');
@@ -203,30 +229,57 @@ export default function LeaveManagement({ isAdmin }: { isAdmin: boolean }) {
       let errorCount = 0;
 
       for (const row of jsonData as any[]) {
-        // Normalize keys (case-insensitive)
+        // Normalize keys (case-insensitive and map to our internal keys)
         const normalizedRow: any = {};
         Object.keys(row).forEach(key => {
-          normalizedRow[key.toLowerCase().trim().replace(/ /g, '_')] = row[key];
+          const k = key.toLowerCase().trim();
+          normalizedRow[k] = row[key];
         });
 
-        if (normalizedRow.employee_id && normalizedRow.date) {
+        const nip = normalizedRow.nip || normalizedRow.employee_id;
+        const name = normalizedRow.name || normalizedRow.employee_name;
+        const dept = normalizedRow.department || normalizedRow.dept;
+        const skill = normalizedRow.skills || normalizedRow.skill;
+        const date = normalizedRow.date;
+        const type = (normalizedRow.type || 'annual').toLowerCase();
+        const reason = normalizedRow.reason || '';
+        const status = (normalizedRow.status || 'pending').toLowerCase();
+
+        if (nip && date) {
           const id = Math.random().toString(36).substring(2, 9);
           
-          let dateStr = normalizedRow.date;
+          let dateStr = date;
           if (dateStr instanceof Date) {
             dateStr = format(dateStr, 'yyyy-MM-dd');
-          } else if (typeof dateStr === 'string' && dateStr.includes('T')) {
-             dateStr = dateStr.split('T')[0];
+          } else if (typeof dateStr === 'string') {
+            // Try to handle dd/mm/yyyy format
+            if (dateStr.includes('/')) {
+              const parts = dateStr.split('/');
+              if (parts.length === 3) {
+                // If dd/mm/yyyy
+                if (parts[2].length === 4) {
+                   dateStr = `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+                } else if (parts[0].length === 4) {
+                   // If yyyy/mm/dd
+                   dateStr = `${parts[0]}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
+                }
+              }
+            } else if (dateStr.includes('T')) {
+              dateStr = dateStr.split('T')[0];
+            }
           }
 
           const submission: LeaveRequest = {
             id,
-            employeeId: String(normalizedRow.employee_id),
-            employeeName: normalizedRow.employee_name || 'Uploaded Staff',
+            employeeId: String(nip),
+            nip: String(nip),
+            employeeName: String(name || 'Uploaded Staff'),
+            department: dept ? String(dept) : undefined,
+            skill: skill ? String(skill) : undefined,
             date: String(dateStr),
-            type: (normalizedRow.type as any) || 'annual',
-            status: (normalizedRow.status as any) || 'pending',
-            reason: normalizedRow.reason || '',
+            type: (type as any) || 'annual',
+            status: (status as any) || 'pending',
+            reason: String(reason),
             submittedAt: new Date().toISOString()
           };
 
@@ -270,8 +323,8 @@ export default function LeaveManagement({ isAdmin }: { isAdmin: boolean }) {
   };
 
   const filteredRequests = requests.filter(req => {
-    const matchesSearch = req.employeeName.toLowerCase().includes(searchTerm.toLowerCase()) || 
-                         (req.reason || '').toLowerCase().includes(searchTerm.toLowerCase());
+    const matchesSearch = (req.employeeName || '').toLowerCase().includes((searchTerm || '').toLowerCase()) || 
+                         (req.reason || '').toLowerCase().includes((searchTerm || '').toLowerCase());
     const matchesStatus = statusFilter === 'all' || req.status === statusFilter;
     return matchesSearch && matchesStatus;
   });
@@ -399,8 +452,15 @@ export default function LeaveManagement({ isAdmin }: { isAdmin: boolean }) {
             <TableHeader className="bg-slate-50/50">
               <TableRow>
                 {isAdmin && <TableHead>Employee</TableHead>}
+                <TableHead>NIP</TableHead>
+                {isAdmin && (
+                  <>
+                    <TableHead>Dept</TableHead>
+                    <TableHead>Skills</TableHead>
+                  </>
+                )}
                 <TableHead>Date</TableHead>
-                <TableHead>Leave Type</TableHead>
+                <TableHead>Type</TableHead>
                 <TableHead>Reason</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
@@ -409,7 +469,7 @@ export default function LeaveManagement({ isAdmin }: { isAdmin: boolean }) {
             <TableBody>
               {filteredRequests.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={isAdmin ? 6 : 5} className="h-32 text-center text-slate-500">
+                  <TableCell colSpan={isAdmin ? 9 : 6} className="h-32 text-center text-slate-500">
                     <div className="flex flex-col items-center gap-2">
                       <CalendarDays className="w-8 h-8 opacity-20" />
                       <p>No leave requests found.</p>
@@ -418,28 +478,37 @@ export default function LeaveManagement({ isAdmin }: { isAdmin: boolean }) {
                 </TableRow>
               ) : (
                 filteredRequests.map((req) => (
-                  <TableRow key={req.id} className="hover:bg-slate-50/50 transition-colors">
+                  <TableRow key={req.id} className="hover:bg-slate-50/50 transition-colors text-xs">
                     {isAdmin && (
                       <TableCell>
                         <div className="flex items-center gap-2">
-                          <div className="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center">
-                            <UserIcon className="w-4 h-4 text-slate-500" />
+                          <div className="w-6 h-6 rounded-full bg-slate-100 flex items-center justify-center">
+                            <UserIcon className="w-3 h-3 text-slate-500" />
                           </div>
-                          <span className="font-medium text-slate-900">{req.employeeName}</span>
+                          <span className="font-bold text-slate-900 leading-none">{req.employeeName}</span>
                         </div>
                       </TableCell>
+                    )}
+                    <TableCell className="font-mono text-slate-500 text-[10px]">
+                      {req.nip || req.employeeId}
+                    </TableCell>
+                    {isAdmin && (
+                      <>
+                        <TableCell className="text-[10px] text-slate-500">{req.department || '-'}</TableCell>
+                        <TableCell className="text-[10px] text-slate-500">{req.skill || '-'}</TableCell>
+                      </>
                     )}
                     <TableCell>
                       {editingId === req.id ? (
                         <Input 
                           type="date" 
-                          className="h-8 text-xs font-mono w-32"
+                          className="h-7 text-[10px] font-mono w-28"
                           value={editForm.date}
                           onChange={e => setEditForm({...editForm, date: e.target.value})}
                         />
                       ) : (
-                        <div className="flex items-center gap-2 font-mono text-sm text-slate-600">
-                          <Calendar className="w-3.5 h-3.5" />
+                        <div className="flex items-center gap-1.5 font-mono font-medium text-slate-600">
+                          <Calendar className="w-3 h-3" />
                           {req.date}
                         </div>
                       )}
@@ -447,7 +516,7 @@ export default function LeaveManagement({ isAdmin }: { isAdmin: boolean }) {
                     <TableCell>
                       {editingId === req.id ? (
                         <select 
-                          className="h-8 text-xs px-2 rounded-md border border-input bg-background"
+                          className="h-7 text-[10px] px-1 rounded-md border border-input bg-background"
                           value={editForm.type}
                           onChange={e => setEditForm({...editForm, type: e.target.value as any})}
                         >
@@ -457,15 +526,15 @@ export default function LeaveManagement({ isAdmin }: { isAdmin: boolean }) {
                           <option value="other">Other</option>
                         </select>
                       ) : (
-                        <Badge variant="outline" className="capitalize">
+                        <Badge variant="outline" className="capitalize text-[10px] h-5 px-1.5 font-bold">
                           {req.type}
                         </Badge>
                       )}
                     </TableCell>
-                    <TableCell className="max-w-[200px] truncate text-slate-600">
+                    <TableCell className="max-w-[150px] truncate text-slate-600">
                       {editingId === req.id ? (
                         <Input 
-                          className="h-8 text-xs"
+                          className="h-7 text-[10px]"
                           value={editForm.reason}
                           onChange={e => setEditForm({...editForm, reason: e.target.value})}
                         />

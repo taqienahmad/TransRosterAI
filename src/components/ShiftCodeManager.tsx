@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { db, collection, onSnapshot, query, setDoc, doc, deleteDoc, OperationType, handleFirestoreError } from '../lib/firebase';
+import { db, collection, onSnapshot, query, setDoc, doc, deleteDoc, OperationType, handleFirestoreError, writeBatch } from '../lib/firebase';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -107,7 +107,7 @@ export default function ShiftCodeManager({ isAdmin }: { isAdmin: boolean }) {
           
           const code = values[codeIndex];
           const interval = values[intervalIndex];
-          const isNight = nightIndex !== -1 ? (values[nightIndex].toLowerCase() === 'yes' || values[nightIndex].toLowerCase() === 'true' || values[nightIndex].toLowerCase() === 'night') : false;
+          const isNight = nightIndex !== -1 && values[nightIndex] ? (values[nightIndex].toLowerCase() === 'yes' || values[nightIndex].toLowerCase() === 'true' || values[nightIndex].toLowerCase() === 'night') : false;
 
           if (code && interval) {
             try {
@@ -202,13 +202,26 @@ export default function ShiftCodeManager({ isAdmin }: { isAdmin: boolean }) {
   const [isClearDialogOpen, setIsClearDialogOpen] = useState(false);
 
   const handleClearAll = async () => {
-    if (!isAdmin) return;
+    if (!isAdmin || shiftCodes.length === 0) return;
     try {
-      const promises = shiftCodes.map(code => deleteDoc(doc(db, 'shiftCodes', code.id)));
-      await Promise.all(promises);
+      const batchSize = 500;
+      const chunks = [];
+      for (let i = 0; i < shiftCodes.length; i += batchSize) {
+        chunks.push(shiftCodes.slice(i, i + batchSize));
+      }
+
+      for (const chunk of chunks) {
+        const batch = writeBatch(db);
+        chunk.forEach(code => {
+          batch.delete(doc(db, 'shiftCodes', code.id));
+        });
+        await batch.commit();
+      }
+
       toast.success('All shift codes cleared');
       setIsClearDialogOpen(false);
     } catch (error) {
+      console.error('Clear shift codes error:', error);
       toast.error('Failed to clear shift codes');
     }
   };
