@@ -15,6 +15,7 @@ import { format, startOfWeek, addDays, isSameDay } from 'date-fns';
 import { AreaChart, Area, BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, ComposedChart, PieChart, Pie } from 'recharts';
 import * as XLSX from 'xlsx';
 import { ShiftCode } from './ShiftCodeManager';
+import { formatMonthYearLabel } from '../lib/utils';
 import { calculateRequiredAgents, calculateRequiredAgentsChat, calculateRequiredAgentsEmail, getIntervalDuration, isIntervalInWindow, matchDayName, applyOperationalWindowsToVolume } from '../lib/erlang';
 import { writeBatch } from '../lib/firebase';
 
@@ -124,6 +125,7 @@ export default function RosterView(props: any) {
   const [isChartExpanded, setIsChartExpanded] = useState(true);
   const [isPolicyExpanded, setIsPolicyExpanded] = useState(false);
   const [isComplianceExpanded, setIsComplianceExpanded] = useState(false);
+  const [expandedAlerts, setExpandedAlerts] = useState<Record<string, boolean>>({});
   
   const [constraints, setConstraints] = useState({
     minRestHours: 13,
@@ -498,7 +500,7 @@ export default function RosterView(props: any) {
                     employeeName: emp.employeeName,
                     date: day.date,
                     type: 'REST',
-                    details: `Insufficient rest: ${Math.round(restMins/60*10)/10}h gap (Policy: ${restThreshold/60}h) between ${prevShift} and ${shift}`,
+                    details: `Insufficient rest: ${Math.round(restMins/60*10)/10}h gap (Policy: ${restThreshold/60}h) dari shift ${prevShift} ke ${shift} pada tanggal ${format(new Date(day.date), 'dd MMM yyyy')}`,
                     suggestion: `Shift jump detected. Minimum 13h gap required.`,
                     currentShift: shift
                   });
@@ -513,7 +515,7 @@ export default function RosterView(props: any) {
                     employeeName: emp.employeeName,
                     date: day.date,
                     type: 'JUMP',
-                    details: `Forbidden JUMP (Backward rotation) from ${prevShift} to ${shift}`,
+                    details: `Forbidden JUMP (Backward rotation) dari shift ${prevShift} ke ${shift} pada tanggal ${format(new Date(day.date), 'dd MMM yyyy')}`,
                     currentShift: shift,
                     suggestion: "Switch to forward rotation."
                   });
@@ -604,7 +606,11 @@ export default function RosterView(props: any) {
       
       const newRoster: EmployeeRoster[] = employees.map(emp => {
         const empExtraDays = (emp.extraWorkingDays !== undefined ? emp.extraWorkingDays : extraWorkingDays) * adjustmentMultiplier;
-        const empTargetWorkingDays = targetWorkingDays + empExtraDays;
+        
+        // Count how many days the employee has approved leave in this cycle
+        const approvedLeavesCount = dates.filter(d => isApprovedLeave(emp.id, d)).length;
+        const empTargetWorkingDays = Math.max(0, targetWorkingDays + empExtraDays - approvedLeavesCount);
+        
         return {
           employeeId: emp.id,
           employeeName: emp.name,
@@ -711,9 +717,12 @@ export default function RosterView(props: any) {
         const day = volumeData[dayIdx];
         const dayWeightsValue = dailyWeights[currentDate] || 0;
         
-        // Determine how many staff need to work today (proportional to demand)
-        const totalCapacity = newRoster.reduce((sum, emp) => sum + emp.targetWorkingDays, 0);
-        const dayTargetHeadcount = Math.min(employees.length, Math.ceil((dayWeightsValue / (totalDemand || 1)) * totalCapacity));
+        // Determine how many staff need to work today (proportional to remaining capacity)
+        const remainingCapacity = newRoster.reduce((sum, emp) => sum + Math.max(0, emp.targetWorkingDays - emp.totalWorkingDays), 0);
+        const remainingWeights = dates.slice(dayIdx).reduce((sum, d) => sum + (dailyWeights[d] || 0), 0);
+        const dayTargetHeadcount = remainingWeights > 0 
+          ? Math.min(employees.length, Math.round((dayWeightsValue / remainingWeights) * remainingCapacity))
+          : 0;
         
         // Select employees for today
         const candidates = [...newRoster].sort((a, b) => {
@@ -738,6 +747,17 @@ export default function RosterView(props: any) {
 
           if (consecutiveWorkMap[empRoster.employeeId] >= getEffectiveMaxConsecWorking()) continue;
 
+          // Prevent over-scheduling (only schedule if they haven't met target, or if we have fewer candidates remaining than target headcount)
+          const remainingEligibleCandidates = candidates.filter(c => 
+            c.totalWorkingDays < c.targetWorkingDays && 
+            !isApprovedLeave(c.employeeId, currentDate) &&
+            consecutiveWorkMap[c.employeeId] < getEffectiveMaxConsecWorking()
+          ).length;
+          
+          if (empRoster.totalWorkingDays >= empRoster.targetWorkingDays && assignedToday + remainingEligibleCandidates >= dayTargetHeadcount) {
+            continue; // Skip this employee if they met their target and we have enough other eligible employees to meet the daily target
+          }
+
           // Find Best Shift for this employee
           let bestShift: ShiftCode | null = null;
           let bestScore = -Infinity;
@@ -747,14 +767,10 @@ export default function RosterView(props: any) {
           const sPrev = shiftCodes.find(sc => sc.code === prevShiftCode);
 
           for (const sc of possibleShifts) {
-            // Check rest hours and forward rotation
-            if (sPrev) {
+            // Check rest hours (minimum rest limit)
+            if (sPrev && sPrev.code !== 'OFF' && sPrev.code !== 'Leave') {
               const restMins = getRestHours(sPrev, sc, empRoster.extraHours || 0);
               if (restMins < getEffectiveRestThreshold()) continue;
-
-              const [pH] = sPrev.startTime.split(':').map(Number);
-              const [cH] = sc.startTime.split(':').map(Number);
-              if (cH < pH) continue; // No backward jumps
             }
 
             // Calculate Coverage Score (Both current and next day carry-over)
@@ -824,14 +840,277 @@ export default function RosterView(props: any) {
           }
         }
 
-        // Fill remaining employees with OFF
+        // Fill remaining employees with OFF / Leave
         candidates.forEach(emp => {
           if (!emp.days[currentDate]) {
-            emp.days[currentDate] = 'OFF';
-            consecutiveWorkMap[emp.employeeId] = 0;
-            lastShiftMap[emp.employeeId] = 'OFF';
+            const onLeave = isApprovedLeave(emp.employeeId, currentDate);
+            if (onLeave) {
+              emp.days[currentDate] = 'Leave';
+              consecutiveWorkMap[emp.employeeId] = 0;
+              lastShiftMap[emp.employeeId] = 'Leave';
+            } else {
+              emp.days[currentDate] = 'OFF';
+              consecutiveWorkMap[emp.employeeId] = 0;
+              lastShiftMap[emp.employeeId] = 'OFF';
+            }
           }
         });
+      }
+
+      // ==========================================
+      // REFINEMENT STAGES FOR ULTRA ICA & EXACT DAYS
+      // ==========================================
+      
+      // Stage 1: Shift Tuning (Swaps / Upgrades work shifts on already scheduled days to maximize interval coverage)
+      for (let dIdx = 0; dIdx < totalDays; dIdx++) {
+        const currentDate = dates[dIdx];
+        const day = volumeData[dIdx];
+        const intervalKeys = sortIntervals(Object.keys(day.intervals));
+        
+        for (const empRoster of newRoster) {
+          const currentShiftCode = empRoster.days[currentDate];
+          if (!currentShiftCode || currentShiftCode === 'OFF' || currentShiftCode === 'Leave') continue;
+          
+          const currentShift = shiftCodes.find(s => s.code === currentShiftCode);
+          if (!currentShift) continue;
+          
+          let bestShift = currentShift;
+          let bestScore = -Infinity;
+          
+          // Current shift score
+          let currentScore = 0;
+          intervalKeys.forEach(interval => {
+            if (isIntervalInShift(interval, currentShift.startTime, currentShift.endTime, empRoster.extraHours || 0, true)) {
+              const req = dailyIntervalRequirements[currentDate][interval][empRoster.skill] || 0;
+              const curr = coverageState[currentDate][interval][empRoster.skill] || 0;
+              const gap = req - curr;
+              if (gap > 0) currentScore += 100 + (gap * 10);
+              else currentScore -= 20;
+            }
+          });
+          
+          bestScore = currentScore;
+          
+          const possibleShifts = shiftCodes.filter(sc => activeShiftCodes.has(sc.code) && sc.code !== currentShiftCode);
+          
+          const prevDate = dIdx > 0 ? dates[dIdx - 1] : null;
+          const nextDate = dIdx + 1 < totalDays ? dates[dIdx + 1] : null;
+          
+          const prevShiftCode = prevDate ? (empRoster.days[prevDate] || 'OFF') : 'OFF';
+          const nextShiftCode = nextDate ? (empRoster.days[nextDate] || 'OFF') : 'OFF';
+          
+          const sPrev = shiftCodes.find(s => s.code === prevShiftCode);
+          const sNext = shiftCodes.find(s => s.code === nextShiftCode);
+          
+          for (const sc of possibleShifts) {
+            // Check rest constraints with yesterday and tomorrow
+            if (sPrev && sPrev.code !== 'OFF' && sPrev.code !== 'Leave') {
+              const restMins = getRestHours(sPrev, sc, empRoster.extraHours || 0);
+              if (restMins < getEffectiveRestThreshold()) continue;
+            }
+            if (sNext && sNext.code !== 'OFF' && sNext.code !== 'Leave') {
+              const restMins = getRestHours(sc, sNext, empRoster.extraHours || 0);
+              if (restMins < getEffectiveRestThreshold()) continue;
+            }
+            
+            let score = 0;
+            intervalKeys.forEach(interval => {
+              if (isIntervalInShift(interval, sc.startTime, sc.endTime, empRoster.extraHours || 0, true)) {
+                const req = dailyIntervalRequirements[currentDate][interval][empRoster.skill] || 0;
+                const curr = coverageState[currentDate][interval][empRoster.skill] || 0;
+                const gap = req - curr;
+                if (gap > 0) score += 100 + (gap * 10);
+                else score -= 20;
+              }
+            });
+            
+            if (score > bestScore) {
+              bestScore = score;
+              bestShift = sc;
+            }
+          }
+          
+          if (bestShift.code !== currentShiftCode) {
+            // Revert coverage
+            intervalKeys.forEach(interval => {
+              if (isIntervalInShift(interval, currentShift.startTime, currentShift.endTime, empRoster.extraHours || 0, true)) {
+                if (coverageState[currentDate][interval]?.[empRoster.skill] > 0) {
+                  coverageState[currentDate][interval][empRoster.skill]--;
+                }
+              }
+            });
+            
+            // Apply coverage of new shift
+            intervalKeys.forEach(interval => {
+              if (isIntervalInShift(interval, bestShift.startTime, bestShift.endTime, empRoster.extraHours || 0, true)) {
+                coverageState[currentDate][interval][empRoster.skill]++;
+              }
+            });
+            
+            empRoster.days[currentDate] = bestShift.code;
+          }
+        }
+      }
+      
+      // Stage 2: Fill shifts for under-scheduled staff to hit targets precisely
+      for (const empRoster of newRoster) {
+        let attempts = 0;
+        const target = Math.round(empRoster.targetWorkingDays);
+        while (empRoster.totalWorkingDays < target && attempts < 15) {
+          attempts++;
+          let bestDayToAssign: string | null = null;
+          let bestShiftToAssign: ShiftCode | null = null;
+          let bestDayScore = -Infinity;
+          
+          for (let dIdx = 0; dIdx < totalDays; dIdx++) {
+            const currentDate = dates[dIdx];
+            
+            if (empRoster.days[currentDate] !== 'OFF') continue;
+            if (isApprovedLeave(empRoster.employeeId, currentDate)) continue;
+            
+            // Check max consecutive working days constraint
+            let consecLeft = 0;
+            for (let i = 1; i <= getEffectiveMaxConsecWorking(); i++) {
+              const dPrev = dIdx - i >= 0 ? dates[dIdx - i] : null;
+              if (dPrev && empRoster.days[dPrev] !== 'OFF' && empRoster.days[dPrev] !== 'Leave') consecLeft++;
+              else break;
+            }
+            let consecRight = 0;
+            for (let i = 1; i <= getEffectiveMaxConsecWorking(); i++) {
+              const dNext = dIdx + i < totalDays ? dates[dIdx + i] : null;
+              if (dNext && empRoster.days[dNext] !== 'OFF' && empRoster.days[dNext] !== 'Leave') consecRight++;
+              else break;
+            }
+            if (consecLeft + consecRight + 1 > getEffectiveMaxConsecWorking()) continue;
+            
+            const day = volumeData[dIdx];
+            const intervalKeys = sortIntervals(Object.keys(day.intervals));
+            const possibleShifts = shiftCodes.filter(sc => activeShiftCodes.has(sc.code));
+            
+            const prevDate = dIdx > 0 ? dates[dIdx - 1] : null;
+            const prevShiftCode = prevDate ? (empRoster.days[prevDate] || 'OFF') : 'OFF';
+            const sPrev = shiftCodes.find(s => s.code === prevShiftCode);
+            
+            const nextDate = dIdx + 1 < totalDays ? dates[dIdx + 1] : null;
+            const nextShiftCode = nextDate ? (empRoster.days[nextDate] || 'OFF') : 'OFF';
+            const sNext = shiftCodes.find(s => s.code === nextShiftCode);
+            
+            for (const sc of possibleShifts) {
+              if (sPrev && sPrev.code !== 'OFF' && sPrev.code !== 'Leave') {
+                const restMins = getRestHours(sPrev, sc, empRoster.extraHours || 0);
+                if (restMins < getEffectiveRestThreshold()) continue;
+              }
+              if (sNext && sNext.code !== 'OFF' && sNext.code !== 'Leave') {
+                const restMins = getRestHours(sc, sNext, empRoster.extraHours || 0);
+                if (restMins < getEffectiveRestThreshold()) continue;
+              }
+              
+              let score = 0;
+              intervalKeys.forEach(interval => {
+                if (isIntervalInShift(interval, sc.startTime, sc.endTime, empRoster.extraHours || 0, true)) {
+                  const req = dailyIntervalRequirements[currentDate][interval][empRoster.skill] || 0;
+                  const curr = coverageState[currentDate][interval][empRoster.skill] || 0;
+                  const gap = req - curr;
+                  if (gap > 0) score += 100 + (gap * 10);
+                  else score -= 10;
+                }
+              });
+              
+              if (score > bestDayScore) {
+                bestDayScore = score;
+                bestDayToAssign = currentDate;
+                bestShiftToAssign = sc;
+              }
+            }
+          }
+          
+          if (bestDayToAssign && bestShiftToAssign) {
+            empRoster.days[bestDayToAssign] = bestShiftToAssign.code;
+            empRoster.totalWorkingDays++;
+            empRoster.totalOffDays--;
+            
+            // Update coverage
+            const day = volumeData.find(d => d.date === bestDayToAssign);
+            if (day) {
+              const intervalKeys = sortIntervals(Object.keys(day.intervals));
+              intervalKeys.forEach(interval => {
+                if (isIntervalInShift(interval, bestShiftToAssign!.startTime, bestShiftToAssign!.endTime, empRoster.extraHours || 0, true)) {
+                  coverageState[bestDayToAssign!][interval][empRoster.skill]++;
+                }
+              });
+            }
+          } else {
+            break; 
+          }
+        }
+      }
+      
+      // Stage 3: Trim shifts for over-scheduled staff to hit targets precisely
+      for (const empRoster of newRoster) {
+        let attempts = 0;
+        const target = Math.round(empRoster.targetWorkingDays);
+        while (empRoster.totalWorkingDays > target && attempts < 15) {
+          attempts++;
+          let bestDayToDrop: string | null = null;
+          let worstDayScore = Infinity;
+          
+          for (let dIdx = 0; dIdx < totalDays; dIdx++) {
+            const currentDate = dates[dIdx];
+            const currentShiftCode = empRoster.days[currentDate];
+            if (!currentShiftCode || currentShiftCode === 'OFF' || currentShiftCode === 'Leave') continue;
+            
+            const sc = shiftCodes.find(s => s.code === currentShiftCode);
+            if (!sc) continue;
+            
+            let score = 0;
+            const day = volumeData[dIdx];
+            const intervalKeys = sortIntervals(Object.keys(day.intervals));
+            
+            intervalKeys.forEach(interval => {
+              if (isIntervalInShift(interval, sc.startTime, sc.endTime, empRoster.extraHours || 0, true)) {
+                const req = dailyIntervalRequirements[currentDate][interval][empRoster.skill] || 0;
+                const curr = coverageState[currentDate][interval][empRoster.skill] || 0;
+                const gap = req - curr;
+                if (gap <= 0) {
+                  score -= 50; 
+                } else {
+                  score += 100 + (gap * 10); 
+                }
+              }
+            });
+            
+            if (score < worstDayScore) {
+              worstDayScore = score;
+              bestDayToDrop = currentDate;
+            }
+          }
+          
+          if (bestDayToDrop) {
+            const currentShiftCode = empRoster.days[bestDayToDrop];
+            const sc = shiftCodes.find(s => s.code === currentShiftCode);
+            
+            empRoster.days[bestDayToDrop] = 'OFF';
+            empRoster.totalWorkingDays--;
+            empRoster.totalOffDays++;
+            
+            // Update coverage
+            if (sc) {
+              const day = volumeData.find(d => d.date === bestDayToDrop);
+              if (day) {
+                const intervalKeys = sortIntervals(Object.keys(day.intervals));
+                intervalKeys.forEach(interval => {
+                  if (isIntervalInShift(interval, sc.startTime, sc.endTime, empRoster.extraHours || 0, true)) {
+                    if (coverageState[bestDayToDrop!][interval]?.[empRoster.skill] > 0) {
+                      coverageState[bestDayToDrop!][interval][empRoster.skill]--;
+                    }
+                  }
+                });
+              }
+            }
+          } else {
+            break;
+          }
+        }
       }
 
       setRoster(newRoster);
@@ -989,6 +1268,141 @@ export default function RosterView(props: any) {
       }
     }
     toast.info("No automatic fix available. Please adjust manually.");
+  };
+
+  const handleFixAllViolations = async () => {
+    if (computedViolationsList.length === 0) {
+      toast.info("Tidak ada pelanggaran kepatuhan yang perlu diperbaiki.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      // Create a deep copy of the roster to work on
+      let updatedRoster = JSON.parse(JSON.stringify(roster));
+      let fixCount = 0;
+
+      // We'll process each violation from computedViolationsList
+      for (const v of computedViolationsList) {
+        if (v.type === 'REST' || v.type === 'JUMP') {
+          const dayIdx = volumeData.findIndex(d => d.date === v.date);
+          if (dayIdx > 0) {
+            const prevDate = volumeData[dayIdx - 1].date;
+            const empIdx = updatedRoster.findIndex((e: any) => e.employeeId === v.employeeId);
+            if (empIdx !== -1) {
+              const emp = updatedRoster[empIdx];
+              const prevShift = emp.days[prevDate] || 'OFF';
+              if (prevShift !== 'OFF') {
+                const sPrev = shiftCodes.find(sc => sc.code === prevShift);
+                if (sPrev) {
+                  const empExtraHours = emp.extraHours !== undefined ? emp.extraHours : extraHours;
+                  const minRestMin = constraints.minRestHours * 60;
+                  const safeShifts = shiftCodes.filter(sc => activeShiftCodes.has(sc.code) && getRestHours(sPrev, sc, empExtraHours) >= minRestMin);
+                  
+                  const [prevStartH] = sPrev.startTime.split(':').map(Number);
+                  const bestShift = safeShifts.find(sc => {
+                    const [currStartH] = sc.startTime.split(':').map(Number);
+                    return currStartH >= prevStartH;
+                  }) || safeShifts[0];
+
+                  if (bestShift) {
+                    const oldShift = emp.days[v.date] || 'OFF';
+                    if (oldShift !== bestShift.code) {
+                      emp.days[v.date] = bestShift.code;
+                      fixCount++;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } else if (v.type === 'CONSECUTIVE' || v.type === 'OFF_AFTER_NIGHT') {
+          const empIdx = updatedRoster.findIndex((e: any) => e.employeeId === v.employeeId);
+          if (empIdx !== -1) {
+            const emp = updatedRoster[empIdx];
+            const oldShift = emp.days[v.date] || 'OFF';
+            if (oldShift !== 'OFF') {
+              emp.days[v.date] = 'OFF';
+              fixCount++;
+            }
+          }
+        } else if (v.type === 'CONSECUTIVE_OFF') {
+          const empIdx = updatedRoster.findIndex((e: any) => e.employeeId === v.employeeId);
+          if (empIdx !== -1) {
+            const emp = updatedRoster[empIdx];
+            const target = Math.round(emp.targetWorkingDays);
+            const minRestMin = constraints.minRestHours * 60;
+            let working = 0;
+            Object.values(emp.days).forEach(s => { 
+              if (s !== 'OFF' && s !== 'Leave') working++; 
+            });
+
+            if (working < target) {
+              for (let idx = 0; idx < volumeData.length; idx++) {
+                const d = volumeData[idx].date;
+                if ((emp.days[d] === 'OFF' || !emp.days[d]) && !isApprovedLeave(emp.employeeId, d)) {
+                  const prevDateStr = idx > 0 ? volumeData[idx-1].date : null;
+                  const nextDateStr = idx < volumeData.length - 1 ? volumeData[idx+1].date : null;
+                  
+                  const prevShift = prevDateStr ? (emp.days[prevDateStr] || 'OFF') : 'OFF';
+                  const nextShift = nextDateStr ? (emp.days[nextDateStr] || 'OFF') : 'OFF';
+                  
+                  const candidateShifts = shiftCodes.filter(sc => activeShiftCodes.has(sc.code));
+                  const bestShift = candidateShifts.find(sc => {
+                    let ok = true;
+                    if (prevShift !== 'OFF' && prevShift !== 'Leave') {
+                      const sPrev = shiftCodes.find(c => c.code === prevShift);
+                      if (sPrev && getRestHours(sPrev, sc, emp.extraHours || 0) < minRestMin) ok = false;
+                    }
+                    if (nextShift !== 'OFF' && nextShift !== 'Leave') {
+                      const sNext = shiftCodes.find(c => c.code === nextShift);
+                      if (sNext && getRestHours(sc, sNext, emp.extraHours || 0) < minRestMin) ok = false;
+                    }
+                    return ok;
+                  });
+
+                  if (bestShift) {
+                    emp.days[d] = bestShift.code;
+                    working++;
+                    fixCount++;
+                    if (working >= target) break;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (fixCount === 0) {
+        toast.info("Tidak ada perubahan yang diperlukan atau perubahan tidak dapat diselesaikan secara otomatis.");
+        return;
+      }
+
+      // Recalculate working and off days for each updated agent
+      updatedRoster = updatedRoster.map((emp: any) => {
+        let working = 0;
+        let off = 0;
+        Object.values(emp.days).forEach(s => {
+          if (s === 'OFF') off++;
+          else working++;
+        });
+        return {
+          ...emp,
+          totalWorkingDays: working,
+          totalOffDays: off
+        };
+      });
+
+      setRoster(updatedRoster);
+      await setDoc(doc(db, 'roster', 'current'), { roster: updatedRoster });
+      toast.success(`🎉 Berhasil memecahkan ${fixCount} pelanggaran kepatuhan secara otomatis!`);
+    } catch (error) {
+      console.error(error);
+      toast.error('Gagal melakukan perbaikan otomatis massal.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const getShiftBadgeClasses = (code: string, isRestViolation: boolean, isConsecViolation: boolean, isOnLeave: boolean = false, isNightViolation: boolean = false) => {
@@ -2976,6 +3390,189 @@ export default function RosterView(props: any) {
         </div>
       </div>
 
+      {/* COMPACT: Labor Policy & Staffing Constraints Settings (Space-Saving Layout) */}
+      <div className="bg-white rounded-xl border border-slate-100 shadow-xs overflow-hidden text-left">
+        <button 
+          type="button"
+          onClick={() => setIsPolicyExpanded(!isPolicyExpanded)}
+          className="w-full flex items-center justify-between p-3.5 hover:bg-slate-50/80 transition-colors text-left"
+        >
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-lg bg-amber-50 flex items-center justify-center text-amber-600 shrink-0">
+              <Settings2 className="w-4.5 h-4.5" />
+            </div>
+            <div>
+              <h4 className="font-extrabold text-slate-900 text-xs flex items-center gap-1.5 uppercase tracking-tight">
+                Labor Policy & Constraints Settings
+                {isAgreedToAdjustments && (
+                  <span className="normal-case font-black text-[9px] text-emerald-750 bg-emerald-50 px-1.5 py-0.5 rounded-full ml-1 uppercase tracking-wider">
+                    OT Adjusted
+                  </span>
+                )}
+              </h4>
+              <p className="text-[10px] text-slate-500 font-medium">
+                Sela istirahat harian, limit kerja berturut-turut, dan toleransi Overtime sebelum men-generate roster.
+              </p>
+            </div>
+          </div>
+          <div className="text-slate-400 hover:text-slate-650 shrink-0">
+            {isPolicyExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+          </div>
+        </button>
+
+        {isPolicyExpanded && (
+          <div className="p-3.5 border-t border-slate-100 bg-slate-50/20 space-y-3.5">
+            {/* 4-Column Constraints Grid */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
+              {/* Sliders 1 */}
+              <div className="border border-slate-100 p-2.5 rounded-lg space-y-1 bg-white shadow-3xs text-left">
+                <div className="flex items-center justify-between gap-1">
+                  <span className="text-[10px] font-black text-slate-600 uppercase tracking-tight truncate">Min Rest Interval</span>
+                  <span className="text-[10px] font-mono font-black text-indigo-600 bg-indigo-50/80 px-1.5 py-0.5 rounded whitespace-nowrap">{constraints.minRestHours}h</span>
+                </div>
+                <Input 
+                  type="range" 
+                  min="10" 
+                  max="18" 
+                  value={constraints.minRestHours}
+                  onChange={(e) => updateConstraint('minRestHours', Number(e.target.value))}
+                  className="w-full accent-indigo-600 h-1 my-1 block"
+                />
+                <span className="text-[9px] text-slate-400 block leading-tight">Sela istirahat antar shif harian</span>
+              </div>
+
+              {/* Slider 2 */}
+              <div className="border border-slate-100 p-2.5 rounded-lg space-y-1 bg-white shadow-3xs text-left">
+                <div className="flex items-center justify-between gap-1">
+                  <span className="text-[10px] font-black text-slate-600 uppercase tracking-tight truncate">Max Consecutive Work</span>
+                  <span className="text-[10px] font-mono font-black text-indigo-600 bg-indigo-50/80 px-1.5 py-0.5 rounded whitespace-nowrap">{constraints.maxConsecutiveWorking} Days</span>
+                </div>
+                <Input 
+                  type="range" 
+                  min="4" 
+                  max="7" 
+                  value={constraints.maxConsecutiveWorking}
+                  onChange={(e) => updateConstraint('maxConsecutiveWorking', Number(e.target.value))}
+                  className="w-full accent-indigo-655 h-1 my-1 block"
+                />
+                <span className="text-[9px] text-slate-400 block leading-tight">Batas hari kerja berturut-turut</span>
+              </div>
+
+              {/* Slider 3 */}
+              <div className="border border-slate-100 p-2.5 rounded-lg space-y-1 bg-white shadow-3xs text-left">
+                <div className="flex items-center justify-between gap-1">
+                  <span className="text-[10px] font-black text-slate-600 uppercase tracking-tight truncate">Max Consecutive Off</span>
+                  <span className="text-[10px] font-mono font-black text-indigo-600 bg-indigo-50/80 px-1.5 py-0.5 rounded whitespace-nowrap">{constraints.maxConsecutiveOff} Days</span>
+                </div>
+                <Input 
+                  type="range" 
+                  min="2" 
+                  max="4" 
+                  value={constraints.maxConsecutiveOff}
+                  onChange={(e) => updateConstraint('maxConsecutiveOff', Number(e.target.value))}
+                  className="w-full accent-indigo-600 h-1 my-1 block"
+                />
+                <span className="text-[9px] text-slate-400 block leading-tight">Maksimal libur berurutan</span>
+              </div>
+
+              {/* Slider 4 */}
+              <div className="border border-slate-100 p-2.5 rounded-lg space-y-1 bg-white shadow-3xs text-left">
+                <div className="flex items-center justify-between gap-1">
+                  <span className="text-[10px] font-black text-slate-600 uppercase tracking-tight truncate">Night Shift Buffer</span>
+                  <span className="text-[10px] font-mono font-black text-indigo-600 bg-indigo-50/80 px-1.5 py-0.5 rounded whitespace-nowrap">{constraints.offAfterNightShift} OFF</span>
+                </div>
+                <Input 
+                  type="range" 
+                  min="1" 
+                  max="3" 
+                  value={constraints.offAfterNightShift}
+                  onChange={(e) => updateConstraint('offAfterNightShift', Number(e.target.value))}
+                  className="w-full accent-indigo-600 h-1 my-1 block"
+                />
+                <span className="text-[9px] text-slate-400 block leading-tight">Wajib istirahat pasca Shift Malam</span>
+              </div>
+            </div>
+
+            {/* Overtime & Demand Adjustment (Extreme Space Saver) */}
+            <div className="bg-indigo-50/20 border border-indigo-100/60 p-3 rounded-xl flex flex-col lg:flex-row items-start lg:items-center justify-between gap-3 bg-white">
+              <div className="flex items-center gap-2.5 text-left">
+                <Switch 
+                  id="compact-agreement"
+                  checked={isAgreedToAdjustments} 
+                  onCheckedChange={handleAgreementToggle} 
+                />
+                <div className="space-y-0.5">
+                  <label htmlFor="compact-agreement" className="text-xs font-black text-slate-900 uppercase tracking-tight cursor-pointer block text-left">
+                    Overtime & Demand Adjustment Multilaterals
+                  </label>
+                  <p className="text-[10px] text-slate-500 leading-tight">
+                    Mengizinkan jam/hari kerja tambahan per agen untuk menutupi defisit slot peak season.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-4 w-full lg:w-auto justify-between lg:justify-end border-t lg:border-t-0 pt-2.5 lg:pt-0 border-slate-100">
+                {/* Additional working days */}
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-tight">Extra Days:</span>
+                  <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-lg p-1 h-8">
+                    <Button 
+                      variant="ghost" 
+                      size="icon" 
+                      type="button"
+                      onClick={() => handleExtraDaysChange(Math.max(0, extraWorkingDays - 1))}
+                      disabled={!isAgreedToAdjustments || extraWorkingDays <= 0}
+                      className="w-6 h-6 rounded p-0 flex items-center justify-center font-bold text-xs"
+                    >
+                      <Minus className="w-3.5 h-3.5" />
+                    </Button>
+                    <span className="text-xs font-black text-slate-800 w-10 text-center font-mono">{extraWorkingDays} days</span>
+                    <Button 
+                      variant="ghost" 
+                      size="icon" 
+                      type="button"
+                      onClick={() => handleExtraDaysChange(extraWorkingDays + 1)}
+                      disabled={!isAgreedToAdjustments}
+                      className="w-6 h-6 rounded p-0 flex items-center justify-center font-bold text-xs"
+                    >
+                      +
+                    </Button>
+                  </div>
+                </div>
+
+                {/* Overtime hours per shift */}
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-tight">OT Hours:</span>
+                  <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-lg p-1 h-8">
+                    <Button 
+                      variant="ghost" 
+                      size="icon" 
+                      type="button"
+                      onClick={() => handleExtraHoursChange(Math.max(0, extraHours - 1))}
+                      disabled={!isAgreedToAdjustments || extraHours <= 0}
+                      className="w-6 h-6 rounded p-0 flex items-center justify-center font-bold text-xs"
+                    >
+                      <Minus className="w-3.5 h-3.5" />
+                    </Button>
+                    <span className="text-xs font-black text-slate-800 w-10 text-center font-mono">{extraHours} hrs</span>
+                    <Button 
+                      variant="ghost" 
+                      size="icon" 
+                      type="button"
+                      onClick={() => handleExtraHoursChange(extraHours + 1)}
+                      disabled={!isAgreedToAdjustments}
+                      className="w-6 h-6 rounded p-0 flex items-center justify-center font-bold text-xs"
+                    >
+                      +
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* Main Interactive Command Bar */}
       <div className="bg-white p-4 rounded-xl border border-slate-100 shadow-sm space-y-4">
         <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-4">
@@ -2983,7 +3580,7 @@ export default function RosterView(props: any) {
             <div className="bg-slate-50 border border-slate-100 px-3.5 py-1.5 rounded-lg flex items-center gap-2">
               <CalendarDays className="w-4 h-4 text-indigo-600" />
               <span className="text-xs font-black text-slate-900 uppercase tracking-tight">
-                {selectedMonth ? format(new Date(selectedMonth), 'MMMM yyyy') : 'No Month Selected'}
+                {selectedMonth ? formatMonthYearLabel(selectedMonth) : 'No Month Selected'}
               </span>
             </div>
 
@@ -3474,255 +4071,166 @@ export default function RosterView(props: any) {
                       </div>
                     </div>
                   ) : (
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      {computedViolationsList.map((v, i) => (
-                        <div 
-                          key={`${v.employeeId}-${v.date}-${v.type}-${i}`} 
-                          className="border border-slate-150 p-4 rounded-xl bg-white flex flex-col justify-between space-y-3 shadow-xs hover:border-slate-300 transition-colors"
-                        >
-                          <div className="flex items-start justify-between">
-                            <div className="flex items-center gap-2.5">
-                              <div className="w-8 h-8 rounded-full bg-rose-50 flex items-center justify-center text-rose-600">
-                                <AlertTriangle className="w-4 h-4" />
-                              </div>
-                              <div className="text-left">
-                                <h4 className="text-xs font-black text-slate-950">{v.employeeName}</h4>
-                                <p className="text-[10px] text-slate-400 uppercase tracking-widest font-mono">
-                                  {format(new Date(v.date), 'dd MMM yyyy')} • {v.type.toUpperCase()}
-                                </p>
-                              </div>
-                            </div>
-                            <Badge variant="destructive" className="bg-rose-500 text-white font-black text-[9px] uppercase">
-                              Rule Breach
-                            </Badge>
-                          </div>
-                          
-                          <p className="text-xs text-slate-600 font-medium text-left leading-relaxed">
-                            {v.message || v.description}
-                          </p>
-
-                          <div className="bg-slate-50 p-2.5 rounded-lg border border-slate-100 text-left">
-                            <span className="block text-[9px] font-black text-slate-400 uppercase tracking-wider">Automated Recommendation</span>
-                            <p className="text-xs text-slate-700 font-medium mt-1">
-                              {v.type === 'rest' 
-                                ? "Assign a late morning/afternoon shift to guarantee at least minimum rest spacing, or toggle off." 
-                                : v.type === 'consecutive'
-                                ? "Force active work assigned shift to OFF to break too long consec working streak."
-                                : "Avoid assigning morning shifts right after evening shifts."
-                              }
-                            </p>
-                          </div>
-
-                          <div className="flex justify-end gap-2 pt-1.5 border-t border-slate-50">
-                            <Button 
-                              variant="outline" 
-                              size="sm"
-                              onClick={() => setEditingCell({
-                                employeeId: v.employeeId,
-                                date: v.date,
-                                employeeName: v.employeeName,
-                                currentShift: roster.find(r => r.employeeId === v.employeeId)?.days[v.date] || 'OFF'
-                              })}
-                              className="h-8 text-[10px] font-bold border-indigo-200 text-indigo-600 hover:bg-slate-50 uppercase tracking-wider"
-                            >
-                              Manual Override
-                            </Button>
-                            <Button 
-                              variant="default" 
-                              size="sm"
-                              onClick={async () => {
-                                await handleManualShiftChange(v.employeeId, v.date, 'OFF');
-                                toast.success(`Quick Repair Applied: ${v.employeeName} pada ${v.date} diset ke OFF!`);
-                              }}
-                              className="h-8 text-[10px] font-bold bg-indigo-600 text-white hover:bg-indigo-700 uppercase tracking-wider"
-                            >
-                              Fix: Force OFF
-                            </Button>
-                          </div>
+                    <div className="space-y-3">
+                      {/* Controller for expanding/collapsing all alerts at once */}
+                      <div className="flex items-center justify-between pb-2 bg-slate-50/55 p-3 rounded-xl border border-slate-100 flex-wrap gap-2.5">
+                        <span className="text-xs text-slate-600 font-extrabold">
+                          Daftar Pelanggaran Aturan Kerja ({computedViolationsList.length})
+                        </span>
+                        <div className="flex gap-1.5 items-center flex-wrap">
+                          <Button
+                            type="button"
+                            variant="default"
+                            size="sm"
+                            disabled={loading}
+                            onClick={handleFixAllViolations}
+                            className="h-7 text-[10px] font-black bg-rose-600 hover:bg-rose-700 text-white px-3 flex items-center gap-1 shrink-0 shadow-sm hover:shadow-md transition-all active:scale-95"
+                          >
+                            <Zap className="w-3 h-3 text-white fill-current animate-pulse" />
+                            Fix All (Selesaikan Semua)
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => {
+                              const updated: Record<string, boolean> = {};
+                              computedViolationsList.forEach((v, index) => {
+                                const alertKey = `${v.employeeId}-${v.date}-${v.type}-${index}`;
+                                updated[alertKey] = true;
+                              });
+                              setExpandedAlerts(updated);
+                            }}
+                            className="h-7 text-[10px] font-bold text-indigo-600 hover:text-indigo-700 hover:bg-indigo-50 px-2.5"
+                          >
+                            Expand All
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setExpandedAlerts({})}
+                            className="h-7 text-[10px] font-bold text-slate-500 hover:text-slate-600 hover:bg-slate-100 px-2.5"
+                          >
+                            Collapse All
+                          </Button>
                         </div>
-                      ))}
+                      </div>
+
+                      {/* Accordion list */}
+                      <div className="border border-slate-100 rounded-xl overflow-hidden divide-y divide-slate-100 bg-white shadow-xs">
+                        {computedViolationsList.map((v, i) => {
+                          const alertKey = `${v.employeeId}-${v.date}-${v.type}-${i}`;
+                          const isItemExpanded = !!expandedAlerts[alertKey];
+
+                          return (
+                            <div 
+                              key={alertKey}
+                              className="transition-colors duration-150"
+                            >
+                              {/* Header Trigger */}
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setExpandedAlerts(prev => ({
+                                    ...prev,
+                                    [alertKey]: !prev[alertKey]
+                                  }));
+                                }}
+                                className="w-full flex items-center justify-between p-3.5 text-left hover:bg-slate-50/50 transition-colors"
+                              >
+                                <div className="flex items-center gap-3 min-w-0 flex-1">
+                                  <div className="w-7.5 h-7.5 rounded-full bg-rose-50 flex items-center justify-center text-rose-500 shrink-0">
+                                    <AlertTriangle className="w-4 h-4" />
+                                  </div>
+                                  <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-3.5 min-w-0 flex-1">
+                                    <span className="text-xs font-black text-slate-900 truncate max-w-[160px]">
+                                      {v.employeeName}
+                                    </span>
+                                    <span className="text-[10px] font-bold text-slate-400 font-mono shrink-0">
+                                      {format(new Date(v.date), 'dd MMM yyyy')}
+                                    </span>
+                                    <Badge variant="destructive" className="bg-rose-50/60 text-rose-700 hover:bg-rose-50/60 font-black text-[9px] uppercase tracking-wider px-2 py-0 shrink-0 border-rose-100/70">
+                                      {v.type.toUpperCase()}
+                                    </Badge>
+                                    <span className="text-xs text-slate-500 font-medium truncate hidden md:inline flex-1 max-w-sm">
+                                      {v.details || v.message || v.description}
+                                    </span>
+                                  </div>
+                                </div>
+                                <div className="text-slate-400 hover:text-slate-600 pl-4 shrink-0">
+                                  {isItemExpanded ? (
+                                    <ChevronUp className="w-4 h-4" />
+                                  ) : (
+                                    <ChevronDown className="w-4 h-4" />
+                                  )}
+                                </div>
+                              </button>
+
+                              {/* Accordion Content */}
+                              {isItemExpanded && (
+                                <div className="p-4 bg-slate-50/30 border-t border-slate-100 flex flex-col space-y-3.5">
+                                  <div className="space-y-1">
+                                    <span className="block text-[9px] font-black text-rose-500 uppercase tracking-widest">Detail Pelanggaran</span>
+                                    <p className="text-xs text-slate-700 font-medium leading-relaxed font-semibold">
+                                      {v.details || v.message || v.description}
+                                    </p>
+                                  </div>
+
+                                  <div className="bg-white p-3 rounded-lg border border-slate-150/70 shadow-3xs">
+                                    <span className="block text-[9px] font-black text-slate-400 uppercase tracking-wider font-semibold">Automated Recommendation</span>
+                                    <p className="text-xs text-slate-600 font-medium mt-1 leading-relaxed">
+                                      {v.type === 'REST' 
+                                        ? "Assign a late morning/afternoon shift to guarantee at least minimum rest spacing, or toggle off." 
+                                        : v.type === 'CONSECUTIVE'
+                                        ? "Force active work assigned shift to OFF to break too long consec working streak."
+                                        : v.type === 'JUMP'
+                                        ? "Switch to forward rotation. Avoid backward jumps (morning right after night shift)."
+                                        : "Adjust shift assignment to satisfy scheduling policies."
+                                      }
+                                    </p>
+                                  </div>
+
+                                  <div className="flex flex-wrap items-center justify-end gap-2 pt-2.5 border-t border-slate-100">
+                                    <Button 
+                                      variant="outline" 
+                                      size="sm"
+                                      onClick={() => setEditingCell({
+                                        employeeId: v.employeeId,
+                                        date: v.date,
+                                        employeeName: v.employeeName,
+                                        currentShift: roster.find(r => r.employeeId === v.employeeId)?.days[v.date] || 'OFF'
+                                      })}
+                                      className="h-8 text-[10px] font-bold border-indigo-250 text-indigo-600 hover:bg-slate-50 uppercase tracking-wider"
+                                    >
+                                      Manual Override
+                                    </Button>
+                                    <Button 
+                                      variant="default" 
+                                      size="sm"
+                                      onClick={async () => {
+                                        await handleManualShiftChange(v.employeeId, v.date, 'OFF');
+                                        toast.success(`Quick Repair Applied: ${v.employeeName} pada ${v.date} diset ke OFF!`);
+                                      }}
+                                      className="h-8 text-[10px] font-bold bg-indigo-600 text-white hover:bg-indigo-700 uppercase tracking-wider"
+                                    >
+                                      Fix: Force OFF
+                                    </Button>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
                     </div>
                   )}
                 </div>
               )}
-            </div>
-
-            {/* COLLAPSIBLE 3: Labor Policy & Staffing Constraints (Rules configuration) */}
-            <div className="bg-white p-5 rounded-xl border border-slate-100 shadow-sm text-left">
-              <button 
-                type="button"
-                onClick={() => setIsPolicyExpanded(!isPolicyExpanded)}
-                className="w-full flex items-center justify-between text-left"
-              >
-                <div className="flex items-center gap-3">
-                  <div className="w-9 h-9 rounded-xl bg-amber-50 flex items-center justify-center text-amber-600">
-                    <Settings2 className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <h4 className="font-extrabold text-slate-900 text-sm">Labor Policy & Constraints Settings</h4>
-                    <p className="text-[11px] text-slate-500 font-medium">
-                      Atur legalitas interval rest minimal, limit hari kerja berturut-turut, dan adaptasi Overtime darurat.
-                    </p>
-                  </div>
-                </div>
-                <div className="text-slate-400 hover:text-slate-600">
-                  {isPolicyExpanded ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
-                </div>
-              </button>
-
-              {isPolicyExpanded && (
-                <div className="pt-6 border-t border-slate-100 mt-4 space-y-6">
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
-                    <div className="space-y-4">
-                      <div className="border border-slate-100 p-4 rounded-xl space-y-3 bg-white">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-black text-slate-700 uppercase tracking-tight">Minimum Daily Rest Interval</span>
-                          <span className="text-xs font-mono font-black text-slate-900 bg-slate-100 px-2 py-0.5 rounded">{constraints.minRestHours} Hours</span>
-                        </div>
-                        <Input 
-                          type="range" 
-                          min="10" 
-                          max="18" 
-                          value={constraints.minRestHours}
-                          onChange={(e) => updateConstraint('minRestHours', Number(e.target.value))}
-                          className="w-full shrink-0 accent-indigo-600 h-1"
-                        />
-                        <p className="text-[10px] text-slate-400 leading-relaxed">
-                          Sela minimal waktu istirahat antar shif harian. Standar Undang-Undang adalah 11-13 jam untuk efisiensi kognitif agen.
-                        </p>
-                      </div>
-
-                      <div className="border border-slate-100 p-4 rounded-xl space-y-3 bg-white">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-black text-slate-700 uppercase tracking-tight">Maximum Consecutive Working Days</span>
-                          <span className="text-xs font-mono font-black text-slate-900 bg-slate-100 px-2 py-0.5 rounded">{constraints.maxConsecutiveWorking} Days</span>
-                        </div>
-                        <Input 
-                          type="range" 
-                          min="4" 
-                          max="7" 
-                          value={constraints.maxConsecutiveWorking}
-                          onChange={(e) => updateConstraint('maxConsecutiveWorking', Number(e.target.value))}
-                          className="w-full shrink-0 accent-indigo-600 h-1"
-                        />
-                        <p className="text-[10px] text-slate-400 leading-relaxed">
-                          Batas maksimal hari kerja berturut-turut sebelum karyawan diwajibkan mendapat hari libur (OFF).
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="space-y-4">
-                      <div className="border border-slate-100 p-4 rounded-xl space-y-3 bg-white">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-black text-slate-705 uppercase tracking-tight">Maximum Consecutive Off Days</span>
-                          <span className="text-xs font-mono font-black text-slate-900 bg-slate-100 px-2 py-0.5 rounded">{constraints.maxConsecutiveOff} Days</span>
-                        </div>
-                        <Input 
-                          type="range" 
-                          min="2" 
-                          max="4" 
-                          value={constraints.maxConsecutiveOff}
-                          onChange={(e) => updateConstraint('maxConsecutiveOff', Number(e.target.value))}
-                          className="w-full shrink-0 accent-indigo-600 h-1"
-                        />
-                        <p className="text-[10px] text-slate-400 leading-relaxed">
-                          Batasan maksimal hari libur berurutan demi menjaga keseimbangan rotasi dan target kapasitas harian.
-                        </p>
-                      </div>
-
-                      <div className="border border-slate-100 p-4 rounded-xl space-y-3 bg-white">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-black text-slate-705 uppercase tracking-tight">Night Shift Recovery Buffer OFF</span>
-                          <span className="text-xs font-mono font-black text-slate-900 bg-slate-100 px-2 py-0.5 rounded">{constraints.offAfterNightShift} Days</span>
-                        </div>
-                        <Input 
-                          type="range" 
-                          min="1" 
-                          max="3" 
-                          value={constraints.offAfterNightShift}
-                          onChange={(e) => updateConstraint('offAfterNightShift', Number(e.target.value))}
-                          className="w-full shrink-0 accent-indigo-600 h-1"
-                        />
-                        <p className="text-[10px] text-slate-400 leading-relaxed">
-                          Hari istirahat wajib setelah agen dijadwalkan masuk Shif Malam untuk memulihkan ritme sirkadian tubuh.
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="bg-indigo-50/10 border border-indigo-100 p-5 rounded-xl space-y-4">
-                    <div className="flex flex-col md:flex-row md:items-center md:justify-between border-b border-indigo-100/50 pb-3 gap-3">
-                      <div className="space-y-0.5 text-left">
-                        <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight">Overtime & Demand Adjustment Multilaterals</h4>
-                        <p className="text-[10px] text-slate-500 leading-relaxed font-semibold">
-                          Mengijinkan penambahan hari kerja atau jam kerja lembur guna menutup gap kapasitas selama peak season.
-                        </p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-black text-slate-700 uppercase tracking-tight">Apply Adjustments:</span>
-                        <Switch 
-                          checked={isAgreedToAdjustments} 
-                          onCheckedChange={handleAgreementToggle} 
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div className="space-y-2">
-                        <span className="block text-[10px] font-black text-slate-400 uppercase tracking-widest text-left">Additional working days per employee:</span>
-                        <div className="flex items-center gap-3">
-                          <Button 
-                            variant="outline" 
-                            onClick={() => handleExtraDaysChange(Math.max(0, extraWorkingDays - 1))}
-                            disabled={!isAgreedToAdjustments || extraWorkingDays <= 0}
-                            className="w-8 h-8 rounded-full p-0 flex items-center justify-center font-bold"
-                          >
-                            <Minus className="w-3.5 h-3.5" />
-                          </Button>
-                          <span className="text-xs font-black text-slate-800 w-16 text-center">{extraWorkingDays} days</span>
-                          <Button 
-                            variant="outline" 
-                            onClick={() => handleExtraDaysChange(extraWorkingDays + 1)}
-                            disabled={!isAgreedToAdjustments}
-                            className="w-8 h-8 rounded-full p-0 flex items-center justify-center font-bold"
-                          >
-                            +
-                          </Button>
-                        </div>
-                        <p className="text-[9px] text-slate-400">Menambahkan kuota kerja lembur per agen ke dalam engine penjadwalan</p>
-                      </div>
-
-                      <div className="space-y-2">
-                        <span className="block text-[10px] font-black text-slate-400 uppercase tracking-widest text-left">Overtime hours per shift:</span>
-                        <div className="flex items-center gap-3">
-                          <Button 
-                            variant="outline" 
-                            onClick={() => handleExtraHoursChange(Math.max(0, extraHours - 1))}
-                            disabled={!isAgreedToAdjustments || extraHours <= 0}
-                            className="w-8 h-8 rounded-full p-0 flex items-center justify-center font-bold"
-                          >
-                            <Minus className="w-3.5 h-3.5" />
-                          </Button>
-                          <span className="text-xs font-black text-slate-800 w-16 text-center">{extraHours} hours</span>
-                          <Button 
-                            variant="outline" 
-                            onClick={() => handleExtraHoursChange(extraHours + 1)}
-                            disabled={!isAgreedToAdjustments}
-                            className="w-8 h-8 rounded-full p-0 flex items-center justify-center font-bold"
-                          >
-                            +
-                          </Button>
-                        </div>
-                        <p className="text-[9px] text-slate-400">Memperpanjang durasi shif harian dari standar 8 jam</p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
 
           </div>
         </div>
+      </div>
 
       {editingCell && (
         <Dialog open={!!editingCell} onOpenChange={() => setEditingCell(null)}>
@@ -3835,7 +4343,7 @@ export default function RosterView(props: any) {
           </DialogHeader>
           <div className="py-3 text-left">
             <p className="text-xs text-slate-600 leading-relaxed">
-              This will permanently delete all shifts scheduled for the active cycle month of <strong className="text-slate-900 font-black">{selectedMonth}</strong>. This action is irreversible and will put the database back into offline/blank state until regenerated.
+              This will permanently delete all shifts scheduled for the active cycle month of <strong className="text-slate-900 font-black">{formatMonthYearLabel(selectedMonth)}</strong>. This action is irreversible and will put the database back into offline/blank state until regenerated.
             </p>
           </div>
           <DialogFooter className="mt-4 gap-2 justify-end">

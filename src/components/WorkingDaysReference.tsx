@@ -60,6 +60,9 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
           const parts = lines[i].split(separator).map(p => p.trim());
           if (parts.length >= 5) {
             const month = parts[0];
+            if (!month) {
+              continue; // Skip lines with empty/missing month values
+            }
             const weekend = parseInt(parts[3]) || 0;
             const holiday = parseInt(parts[4]) || 0;
             const data = {
@@ -77,6 +80,11 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
           }
         }
         
+        if (successCount === 0) {
+          toast.error('No valid references found in the CSV');
+          return;
+        }
+        
         toast.success(`Successfully uploaded ${successCount} references`);
       } catch (err) {
         handleFirestoreError(err, OperationType.UPDATE, 'workingDaysRef/upload');
@@ -88,6 +96,10 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
   };
 
   const handleDelete = async (id: string) => {
+    if (!id) {
+      toast.error('Invalid ID to delete');
+      return;
+    }
     try {
       await deleteDoc(doc(db, 'workingDaysRef', id));
       toast.success('Reference deleted');
@@ -109,7 +121,9 @@ export default function WorkingDaysReference({ isAdmin }: { isAdmin: boolean }) 
       for (const chunk of chunks) {
         const batch = writeBatch(db);
         chunk.forEach(ref => {
-          batch.delete(doc(db, 'workingDaysRef', ref.id));
+          if (ref.id) {
+            batch.delete(doc(db, 'workingDaysRef', ref.id));
+          }
         });
         await batch.commit();
       }

@@ -6,6 +6,7 @@ import { Calendar, TrendingUp, LayoutDashboard, Info, ShieldCheck, ClipboardChec
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { format } from 'date-fns';
+import { formatMonthYearLabel } from '../lib/utils';
 import { 
   Dialog, 
   DialogContent, 
@@ -65,12 +66,14 @@ export default function SchedulingHub(props: any) {
             <div className="flex items-center gap-2">
               <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest whitespace-nowrap">Global Period:</span>
               <Select value={selectedMonth} onValueChange={setSelectedMonth}>
-                <SelectTrigger className="w-[110px] border-none shadow-none h-5 p-0 text-xs font-bold text-slate-900 focus:ring-0">
+                <SelectTrigger className="w-[130px] border-none shadow-none h-5 p-0 text-xs font-bold text-slate-900 focus:ring-0">
                   <SelectValue placeholder="Month" />
                 </SelectTrigger>
                 <SelectContent className="rounded-lg border-slate-200">
                   {availableMonths.map(m => (
-                    <SelectItem key={m} value={m} className="text-xs font-medium">{m}</SelectItem>
+                    <SelectItem key={m} value={m} className="text-xs font-medium">
+                      {formatMonthYearLabel(m)}
+                    </SelectItem>
                   ))}
                 </SelectContent>
               </Select>

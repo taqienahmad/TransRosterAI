@@ -23,7 +23,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import ErlangForecaster from './ErlangForecaster';
 import OperationalWindowSettings from './OperationalWindowSettings';
 import { ShiftCode } from './ShiftCodeManager';
-import { isIntervalInWindow } from '../lib/erlang';
+import { isIntervalInWindow, calculateRequiredAgents, calculateRequiredAgentsChat, calculateRequiredAgentsEmail, ErlangResult, getIntervalDuration, applyOperationalWindowsToVolume } from '../lib/erlang';
 
 interface Employee {
   id: string;
@@ -154,21 +154,66 @@ export default function ForecastView(props: any) {
     const avgDailyVolume = Math.round(totalVolume / volumeData.length);
     const busiestDay = volumeData.reduce((prev, curr) => (curr.totalVolume > prev.totalVolume) ? curr : prev);
     
-    // Use Erlang Results for accurate FTE if available
-    const relevantResults = erlangResults.filter(r => volumeData.some(v => v.date === r.date));
-    
-    let totalWorkHours = 0;
-    let grossFTE = 0;
-    let netFTE = 0;
-    
     const operationalWindows = erlangSettings?.operationalWindows;
-    
     const channelType = erlangSettings?.channelType || 'call';
     const extraWorkingDays = erlangSettings?.extraWorkingDays || 0;
     const extraHours = erlangSettings?.extraHours || 0;
 
     const isAgreed = erlangSettings?.isSimulationAgreed || false;
     const adjustmentMultiplier = isAgreed ? 1 : 0;
+
+    const slFactor = (erlangSettings?.targetSL || 80) > 1 ? (erlangSettings?.targetSL || 80) / 100 : (erlangSettings?.targetSL || 80);
+    const sFactor = (erlangSettings?.shrinkage || 30) > 1 ? (erlangSettings?.shrinkage || 30) / 100 : (erlangSettings?.shrinkage || 30);
+    const shrinkageFactor = Math.min(0.99, sFactor);
+    const currentExtraHours = isAgreed ? extraHours : 0;
+    const shiftLength = 8 + currentExtraHours;
+
+    let processedVolumeForErlang = applyOperationalWindowsToVolume(volumeData, operationalWindows);
+
+    const relevantResults = processedVolumeForErlang.map(data => {
+      const intervalNeeds: Record<string, number> = {};
+      const allIntervalKeys = Object.keys(data.intervals).sort();
+      
+      let dayPeak = 0;
+      let dayTotalDemandHours = 0;
+
+      Object.entries(data.intervals).forEach(([interval, effectiveVolume]) => {
+        const v = Number(effectiveVolume) || 0;
+        const duration = getIntervalDuration(interval, allIntervalKeys);
+        
+        let res: ErlangResult;
+        if (channelType === 'chat' || channelType === 'whatsapp' || channelType === 'multiskill_chat_wa') {
+          res = calculateRequiredAgentsChat(v, erlangSettings?.aht || 300, slFactor, erlangSettings?.frt || 60, erlangSettings?.concurrency || 2, duration);
+        } else if (channelType === 'email') {
+          res = calculateRequiredAgentsEmail(v, erlangSettings?.aht || 300, slFactor, erlangSettings?.tat || 3600, duration);
+        } else {
+          res = calculateRequiredAgents(v, erlangSettings?.aht || 300, slFactor, erlangSettings?.targetTime || 20, duration);
+        }
+
+        const grossNeeded = shrinkageFactor >= 1 ? res.agents : Math.ceil(res.agents / (1 - shrinkageFactor));
+        intervalNeeds[interval] = Math.max(0, grossNeeded);
+        dayTotalDemandHours += grossNeeded * duration;
+        if (grossNeeded > dayPeak) dayPeak = grossNeeded;
+      });
+
+      const startsNeeded = Math.ceil(dayTotalDemandHours / shiftLength);
+
+      return {
+        date: data.date,
+        day: data.day,
+        totalAgents: startsNeeded,
+        activeCoverage: startsNeeded,
+        peakAgents: Math.ceil(dayPeak),
+        dayTotalHours: dayTotalDemandHours,
+        intervalNeeds
+      };
+    });
+
+    let totalWorkHours = relevantResults.reduce((acc, r) => acc + (r.dayTotalHours || 0), 0);
+    const monthlyPersonHours = 8 * targetWorkingDays;
+    
+    let netFTE = (totalWorkHours * (1 - shrinkageFactor)) / monthlyPersonHours;
+    let grossFTE = Math.ceil(totalWorkHours / monthlyPersonHours);
 
     // Calculate Effective Available Capacity (FTE) - NO BUFFER for main gap
     const totalCapacityHours = employees.reduce((sum, emp) => {
@@ -187,38 +232,6 @@ export default function ForecastView(props: any) {
 
     const monthlyStandardHours = 8 * targetWorkingDays;
     const effectiveAvailableFTE = (totalCapacityHours / monthlyStandardHours);
-    
-    // Calculate Required Headcount (Body Count)
-    // Demand is fixed at standard 8h shifts
-    const monthlyPersonHours = 8 * targetWorkingDays;
-
-    if (relevantResults.length > 0) {
-      totalWorkHours = relevantResults.reduce((acc, r) => acc + (r.dayTotalHours || 0), 0);
-      const shrinkage = (erlangSettings?.shrinkage || 30) / 100;
-      // Since totalWorkHours already includes shrinkage, netFTE is totalWorkHours corrected back to net,
-      // and grossFTE is the directly divided totalWorkHours.
-      netFTE = (totalWorkHours * (1 - shrinkage)) / monthlyPersonHours;
-      grossFTE = Math.ceil(totalWorkHours / monthlyPersonHours);
-    } else {
-      // Fallback to estimation if no erlang results yet
-      const aht = erlangSettings?.aht || 300;
-      const shrinkage = (erlangSettings?.shrinkage || 30) / 100;
-      const concurrency = erlangSettings?.concurrency || 1;
-      
-      // Basic workload estimation
-      let estimatedWorkHours = (totalVolume * aht) / 3600;
-      
-      // Adjust for concurrency if chat
-      if (channelType === 'chat' || channelType === 'whatsapp' || channelType === 'multiskill_chat_wa') {
-        estimatedWorkHours = estimatedWorkHours / concurrency;
-      }
-      
-      // Add a 15% "Erlang Buffer" for fallback estimation to be more realistic than pure workload
-      totalWorkHours = estimatedWorkHours * 1.15; 
-      
-      netFTE = totalWorkHours / monthlyPersonHours;
-      grossFTE = Math.ceil(netFTE / (1 - shrinkage));
-    }
 
     return {
       totalVolume,

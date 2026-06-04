@@ -8,7 +8,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Badge } from '@/components/ui/badge';
 import { calculateRequiredAgents, calculateRequiredAgentsChat, calculateRequiredAgentsEmail, ErlangResult, getIntervalDuration, isIntervalInWindow, matchDayName, applyOperationalWindowsToVolume } from '../lib/erlang';
 import * as XLSX from 'xlsx';
-import { Calculator, FileText, TrendingUp, Clock, Users, Calendar, RefreshCw, AlertCircle, MessageSquare, Mail, Phone, ShieldCheck, Download, Zap, ArrowRight, ClipboardCheck, Brain, Sparkles, Loader2 } from 'lucide-react';
+import { Calculator, FileText, TrendingUp, Clock, Users, Calendar, RefreshCw, AlertCircle, MessageSquare, Mail, Phone, ShieldCheck, Download, Zap, ArrowRight, ClipboardCheck, Brain, Sparkles, Loader2, Info } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { toast } from 'sonner';
@@ -90,9 +90,73 @@ export default function ErlangForecaster({
   }, [initialSettings]);
 
   const results = useMemo(() => {
-    return erlangResults.filter(r => volumeData.some(v => v.date === r.date))
-      .sort((a, b) => a.date.localeCompare(b.date));
-  }, [erlangResults, volumeData]);
+    if (!volumeData || volumeData.length === 0) return [];
+    
+    const slFactor = targetSL > 1 ? targetSL / 100 : targetSL;
+    const sFactor = shrinkage > 1 ? shrinkage / 100 : shrinkage;
+    const shrinkageFactor = Math.min(0.99, sFactor);
+    const currentExtraHours = isAgreedToManpowerAdjustments ? extraHours : 0;
+    const shiftLength = 8 + currentExtraHours;
+
+    let processedVolume = applyOperationalWindowsToVolume(volumeData, operationalWindows);
+
+    return processedVolume.map(data => {
+      const intervalNeeds: Record<string, number> = {};
+      const allIntervalKeys = Object.keys(data.intervals).sort();
+      
+      let dayPeak = 0;
+      let dayTotalDemandHours = 0;
+
+      Object.entries(data.intervals).forEach(([interval, effectiveVolume]) => {
+        const v = Number(effectiveVolume) || 0;
+        const duration = getIntervalDuration(interval, allIntervalKeys);
+        
+        let res: ErlangResult;
+        if (channelType === 'chat' || channelType === 'whatsapp' || channelType === 'multiskill_chat_wa') {
+          res = calculateRequiredAgentsChat(v, aht, slFactor, frt, concurrency, duration);
+        } else if (channelType === 'email') {
+          res = calculateRequiredAgentsEmail(v, aht, slFactor, tat, duration);
+        } else {
+          res = calculateRequiredAgents(v, aht, slFactor, targetTime, duration);
+        }
+
+        const grossNeeded = shrinkageFactor >= 1 ? res.agents : Math.ceil(res.agents / (1 - shrinkageFactor));
+        intervalNeeds[interval] = Math.max(0, grossNeeded);
+        dayTotalDemandHours += grossNeeded * duration;
+        if (grossNeeded > dayPeak) dayPeak = grossNeeded;
+      });
+
+      // Simple mock/estimated shift suggestions so total is exactly startsNeeded
+      const shiftSuggestions: Record<string, number> = {};
+      shiftCodes.forEach(c => shiftSuggestions[c.code] = 0);
+      
+      const startsNeeded = Math.ceil(dayTotalDemandHours / shiftLength);
+      if (shiftCodes.length > 0) {
+        const countPerShift = Math.floor(startsNeeded / shiftCodes.length);
+        let assigned = 0;
+        shiftCodes.forEach((sc, idx) => {
+          const count = idx === shiftCodes.length - 1 ? startsNeeded - assigned : countPerShift;
+          shiftSuggestions[sc.code] = count;
+          assigned += count;
+        });
+      }
+
+      const shiftCoverage: Record<string, number> = { ...shiftSuggestions };
+
+      return {
+        date: data.date,
+        day: data.day,
+        totalAgents: startsNeeded,
+        activeCoverage: startsNeeded,
+        peakAgents: Math.ceil(dayPeak),
+        dayTotalHours: dayTotalDemandHours,
+        intervalNeeds,
+        shiftSuggestions,
+        shiftCoverage,
+        intervalSupply: {}
+      };
+    }).sort((a, b) => a.date.localeCompare(b.date));
+  }, [volumeData, channelType, aht, targetSL, targetTime, frt, concurrency, tat, shrinkage, isAgreedToManpowerAdjustments, extraHours, shiftCodes, operationalWindows]);
 
   const [calculating, setCalculating] = useState(false);
   const [bootstrapping, setBootstrapping] = useState(false);
@@ -755,33 +819,76 @@ export default function ErlangForecaster({
     const extraWorkingDaysPerPeriod = isAgreedToManpowerAdjustments ? extraWorkingDays : 0;
     const totalWorkingDaysPerAgent = (workingDays || 0) + extraWorkingDaysPerPeriod;
 
-    return results.map(res => {
-      // Count agents starting on this day from legacyRoster or roster array
-      let agentsScheduledToStart = 0;
+    // Check if we have ANY scheduled starts across the entire period
+    const totalActualStartsAcrossPeriod = results.reduce((sum, res) => {
+      let dailyStarts = 0;
+      const employeeShifts: Record<string, string> = {};
+
       if (legacyRoster) {
-        Object.values(legacyRoster).forEach(empDays => {
+        Object.entries(legacyRoster).forEach(([empId, empDays]) => {
           const shiftCode = empDays[res.date];
-          if (shiftCode && shiftCode !== 'OFF' && !['L', 'AL', 'UL', 'SL', 'ML', 'PL'].includes(shiftCode)) {
-            agentsScheduledToStart++;
+          if (shiftCode) {
+            employeeShifts[empId] = shiftCode;
           }
         });
       }
       
       if (roster && Array.isArray(roster)) {
         roster.forEach(empRoster => {
-          const shiftCode = empRoster.schedule?.[res.date];
-          if (shiftCode && shiftCode !== 'OFF' && !['L', 'AL', 'UL', 'SL', 'ML', 'PL'].includes(shiftCode)) {
-            agentsScheduledToStart++;
+          const empId = empRoster.employeeId || empRoster.id;
+          const shiftCode = empRoster.days?.[res.date] || empRoster.schedule?.[res.date];
+          if (empId && shiftCode) {
+            employeeShifts[empId] = shiftCode;
           }
         });
       }
+
+      Object.values(employeeShifts).forEach(shiftCode => {
+        if (shiftCode && shiftCode !== 'OFF' && !['L', 'AL', 'UL', 'SL', 'ML', 'PL'].includes(shiftCode)) {
+          dailyStarts++;
+        }
+      });
+      return sum + dailyStarts;
+    }, 0);
+
+    const hasAnyRosterData = totalActualStartsAcrossPeriod > 0;
+
+    return results.map(res => {
+      // Count agents starting on this day from legacyRoster or roster array (deduplicated by employee ID)
+      let agentsScheduledToStart = 0;
+      const employeeShifts: Record<string, string> = {};
+
+      if (legacyRoster) {
+        Object.entries(legacyRoster).forEach(([empId, empDays]) => {
+          const shiftCode = empDays[res.date];
+          if (shiftCode) {
+            employeeShifts[empId] = shiftCode;
+          }
+        });
+      }
+      
+      if (roster && Array.isArray(roster)) {
+        roster.forEach(empRoster => {
+          const empId = empRoster.employeeId || empRoster.id;
+          const shiftCode = empRoster.days?.[res.date] || empRoster.schedule?.[res.date];
+          if (empId && shiftCode) {
+            employeeShifts[empId] = shiftCode;
+          }
+        });
+      }
+
+      Object.values(employeeShifts).forEach(shiftCode => {
+        if (shiftCode && shiftCode !== 'OFF' && !['L', 'AL', 'UL', 'SL', 'ML', 'PL'].includes(shiftCode)) {
+          agentsScheduledToStart++;
+        }
+      });
 
       // Base daily supply = (Total Agents * Total Working Days) / Period Days
       // This represents the average number of agents available per day
       const avgDailySupply = totalDays > 0 ? (employees.length * totalWorkingDaysPerAgent) / totalDays : 0;
       
       // If we have actual roster data, use it; otherwise fallback to the calculated average
-      const baseAvailable = agentsScheduledToStart > 0 ? agentsScheduledToStart : avgDailySupply;
+      const baseAvailable = hasAnyRosterData ? agentsScheduledToStart : avgDailySupply;
       
       // Effective available takes into account extra hours productivity (capacity multiplier)
       const effectiveAvailable = baseAvailable * capacityMultiplier;
@@ -1348,6 +1455,13 @@ export default function ErlangForecaster({
                       </div>
                     </div>
                   </CardDescription>
+                  
+                  <div className="mt-3 p-3.5 bg-blue-50/50 border border-blue-100 rounded-xl flex items-start gap-2.5 text-xs text-blue-800 leading-relaxed">
+                    <Info className="w-4 h-4 text-blue-500 mt-0.5 shrink-0" />
+                    <div>
+                      <span className="font-bold">Penjelasan Tabel:</span> Tabel heatmap interaktif di bawah ini menunjukkan <strong>Proyeksi Distribusi Volume Inbound (Kontak Masuk)</strong> untuk tiap interval waktu 1 jam per harinya. Gradasi warna biru merepresentasikan tingkat kepadatan aktivitas—semakin pekat atau gelap warnanya, semakin tinggi volume kontak yang masuk, mempermudah Anda dalam mengenali jam-jam sibuk (peak hours) kerja.
+                    </div>
+                  </div>
                 </CardHeader>
                 <CardContent className="p-0">
                   <div className="overflow-x-auto">
@@ -1439,6 +1553,13 @@ export default function ErlangForecaster({
                        <Calculator className="w-5 h-5 text-indigo-600" />
                     </div>
                   </div>
+                  
+                  <div className="mt-3 p-3.5 bg-indigo-50 border border-indigo-100/60 rounded-xl flex items-start gap-2.5 text-xs text-indigo-950 leading-relaxed shadow-xs">
+                    <Info className="w-4 h-4 text-indigo-600 mt-0.5 shrink-0" />
+                    <div>
+                      <span className="font-bold">Penjelasan Tabel:</span> Tabel ini menampilkan <strong>Jumlah Kebutuhan Personel (Agen Aktif)</strong> di setiap interval 1 jam. Angka di dalam kolom mewakili jumlah minimum staf standby yang harus bertugas (FTE) untuk memenuhi Service Level yang Anda konfigurasi di panel atas, setelah memperhitungkan faktor kehilangan waktu (shrinkage).
+                    </div>
+                  </div>
                 </CardHeader>
                 <CardContent className="p-6 pt-0">
                   {/* Trend Chart */}
@@ -1525,108 +1646,6 @@ export default function ErlangForecaster({
                         );
                       })()}
                     </div>
-                  </div>
-                </CardContent>
-              </Card>
-
-              <Card className="border-none shadow-sm overflow-hidden bg-white">
-                <CardHeader className="pb-2">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <CardTitle className="flex items-center gap-2 text-indigo-700">
-                        <Users className="w-5 h-5" />
-                        Daily Staffing Requirement vs Availability
-                      </CardTitle>
-                      <CardDescription>
-                        Analisis perbandingan antara kebutuhan agen hasil Erlang C dengan jumlah agen yang tersedia di roster (Starts Analysis).
-                      </CardDescription>
-                    </div>
-                  </div>
-                </CardHeader>
-                <CardContent className="p-6">
-                  {/* Daily Trend Chart */}
-                  <div className="h-[300px] w-full mb-8">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <LineChart data={dailyStaffingStats}>
-                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                        <XAxis 
-                          dataKey="date" 
-                          axisLine={false} 
-                          tickLine={false} 
-                          tick={{fontSize: 10, fill: '#64748b'}}
-                          tickFormatter={(val) => {
-                            const parts = val.split('-');
-                            return parts.length >= 3 ? `${parts[2]}/${parts[1]}` : val;
-                          }}
-                        />
-                        <YAxis 
-                          axisLine={false} 
-                          tickLine={false} 
-                          tick={{fontSize: 10, fill: '#64748b'}}
-                        />
-                        <Tooltip 
-                          contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)' }}
-                        />
-                        <Legend iconType="circle" />
-                        <Line type="monotone" dataKey="required" name="Required (Erlang)" stroke="#6366f1" strokeWidth={3} dot={{ r: 4, fill: '#6366f1' }} activeDot={{ r: 6 }} />
-                        <Line 
-                          type="monotone" 
-                          dataKey="available" 
-                          name={`Available (${isAgreedToManpowerAdjustments ? 'Simulation' : 'Roster'})`} 
-                          stroke="#10b981" 
-                          strokeWidth={3} 
-                          dot={{ r: 4, fill: '#10b981' }} 
-                          activeDot={{ r: 6 }} 
-                        />
-                      </LineChart>
-                    </ResponsiveContainer>
-                  </div>
-
-                  {/* Summary Table */}
-                  <div className="rounded-xl border border-slate-100 overflow-hidden shadow-sm">
-                    <Table>
-                      <TableHeader className="bg-slate-50">
-                        <TableRow>
-                          <TableHead className="text-[10px] font-black uppercase tracking-widest text-slate-400">Date</TableHead>
-                          <TableHead className="text-[10px] font-black uppercase tracking-widest text-slate-400 text-center">Required</TableHead>
-                          <TableHead className="text-[10px] font-black uppercase tracking-widest text-slate-400 text-center">
-                            {isAgreedToManpowerAdjustments ? 'Eff. Available' : 'Available'}
-                          </TableHead>
-                          <TableHead className="text-[10px] font-black uppercase tracking-widest text-slate-400 text-center">Gap</TableHead>
-                          <TableHead className="text-[10px] font-black uppercase tracking-widest text-slate-400 text-right">Status</TableHead>
-                        </TableRow>
-                      </TableHeader>
-                      <TableBody>
-                        {dailyStaffingStats.map((stat) => (
-                          <TableRow key={stat.date}>
-                            <TableCell className="py-2">
-                              <div className="flex flex-col">
-                                <span className="text-xs font-black text-slate-800">{stat.date}</span>
-                                <span className="text-[9px] text-slate-400 font-bold uppercase">{stat.day}</span>
-                              </div>
-                            </TableCell>
-                            <TableCell className="text-center py-2">
-                              <span className="text-xs font-black text-slate-700">{stat.required}</span>
-                            </TableCell>
-                            <TableCell className="text-center py-2">
-                              <span className="text-xs font-black text-indigo-600">{stat.available}</span>
-                            </TableCell>
-                            <TableCell className="text-center py-2">
-                              <span className={`text-xs font-black ${stat.gap < 0 ? 'text-rose-600 font-black' : 'text-emerald-600 font-black'}`}>
-                                {stat.gap > 0 ? '+' : ''}{stat.gap}
-                              </span>
-                            </TableCell>
-                            <TableCell className="text-right py-2">
-                              {stat.isShortage ? (
-                                <Badge className="bg-rose-50 text-rose-600 hover:bg-rose-100 border-rose-100 text-[8px] font-black tracking-widest px-2 py-0.5">SHORTAGE</Badge>
-                              ) : (
-                                <Badge className="bg-emerald-50 text-emerald-600 hover:bg-emerald-100 border-emerald-100 text-[8px] font-black tracking-widest px-2 py-0.5">OK</Badge>
-                              )}
-                            </TableCell>
-                          </TableRow>
-                        ))}
-                      </TableBody>
-                    </Table>
                   </div>
                 </CardContent>
               </Card>
